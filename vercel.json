@@ -1,0 +1,38 @@
+{
+  "headers": [
+    {
+      "source": "/sw.js",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache"
+        }
+      ]
+    }
+  ],
+  "functions": {
+    "api/whatsapp.js": {
+      "maxDuration": 60
+    },
+    "api/cron.js": {
+      "maxDuration": 300
+    },
+    "api/jobs.js": {
+      "maxDuration": 300,
+      "includeFiles": "assets/**"
+    },
+    "api/media.js": {
+      "maxDuration": 300,
+      "includeFiles": "{assets/**,node_modules/ffmpeg-static/ffmpeg}"
+    },
+    "api/site-data.js": {
+      "maxDuration": 30
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron",
+      "schedule": "0 6 * * *"
+    }
+  ]
+}

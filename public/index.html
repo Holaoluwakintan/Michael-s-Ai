@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>Michael AI</title>
+<meta name="description" content="Michael's private AI assistant">
+<meta name="theme-color" content="#1c1b1e">
+<meta name="robots" content="noindex, nofollow">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css?v=3">
+</head>
+<body>
+<!-- Passcode gate -->
+<section id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <div class="avatar big" aria-hidden="true">M</div>
+    <h1>Michael AI</h1>
+    <p class="muted">Private. Enter your passcode.</p>
+    <form id="gateForm" autocomplete="off">
+      <input id="gateInput" inputmode="numeric" pattern="[0-9]*" maxlength="12" placeholder="••••••" aria-label="Passcode" autocomplete="one-time-code">
+      <button class="btn-primary" type="submit">Enter</button>
+    </form>
+    <p id="gateErr" class="err" role="alert"></p>
+  </div>
+</section>
+
+<div id="app" class="app" hidden>
+  <!-- CHAT -->
+  <section id="chatView" class="screen">
+    <header class="wa-head">
+      <div class="avatar" aria-hidden="true">M</div>
+      <div class="who">
+        <h1>Michael AI</h1>
+        <p id="status" class="status">online</p>
+      </div>
+      <button class="icon-btn" id="newBtn" aria-label="New chat" title="New chat">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4Z M13.5 6.5l4 4" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon-btn" id="menuBtn" aria-label="Menu" title="Menu">
+        <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="5" r="1.9" fill="currentColor"/><circle cx="12" cy="12" r="1.9" fill="currentColor"/><circle cx="12" cy="19" r="1.9" fill="currentColor"/></svg>
+      </button>
+    </header>
+
+    <main id="msgs" class="msgs" aria-live="polite"></main>
+
+    <div class="composer-wrap">
+      <div id="tools" class="tools" hidden>
+        <div class="tools-head"><span>✨ Content tools</span><span class="muted small">writes in your voice</span></div>
+        <div id="chips" class="chips"></div>
+      </div>
+      <form id="composer" class="composer">
+        <div class="pill-input">
+          <button type="button" id="toolsBtn" class="tools-btn" aria-label="Content tools" aria-expanded="false" title="Content tools">✨</button>
+          <textarea id="input" rows="1" placeholder="Message" aria-label="Message"></textarea>
+        </div>
+        <button id="sendBtn" class="send" type="submit" aria-label="Send">
+          <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z" fill="currentColor"/></svg>
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <!-- MEMORY -->
+  <section id="memoryView" class="screen" hidden>
+    <header class="wa-head">
+      <button class="icon-btn back" data-back aria-label="Back to chat">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M19 12H5M11 6l-6 6 6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <div class="who"><h1>Teach Michael AI</h1><p class="status">Memory · <span id="memCount">0</span> notes</p></div>
+    </header>
+    <main class="page">
+      <p class="muted small intro">Facts and instructions in plain words. Michael AI reads all of them before every reply. They stay on this phone. Tip: in chat, just type <strong>"remember that …"</strong>.</p>
+      <form id="memForm" class="mem-form">
+        <textarea id="memInput" rows="3" placeholder="e.g. My wife's name is …&#10;Always use British spelling&#10;My church is …" aria-label="New memory"></textarea>
+        <button class="btn-primary" type="submit">Add</button>
+      </form>
+      <div class="meter"><div id="memBar"></div></div>
+      <p id="memUsage" class="muted small"></p>
+      <ul id="memList" class="mem-list"></ul>
+      <div class="row gap">
+        <button class="ghost" id="memExport">Export memory</button>
+        <button class="ghost" id="memImportBtn">Import memory</button>
+        <input type="file" id="memImport" accept="application/json,.json" hidden>
+      </div>
+    </main>
+  </section>
+
+  <!-- CONTENT BANK -->
+  <section id="bankView" class="screen" hidden>
+    <header class="wa-head">
+      <button class="icon-btn back" data-back aria-label="Back to chat">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M19 12H5M11 6l-6 6 6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <div class="who"><h1>Content Bank</h1><p class="status">Day <span id="dayNum">1</span> of 30</p></div>
+    </header>
+    <main class="page">
+      <div class="day-ctl">
+        <button class="ghost sq" id="dayPrev" aria-label="Previous day">&lsaquo;</button>
+        <input id="dayInput" type="number" min="1" max="30" inputmode="numeric" aria-label="Day number">
+        <button class="ghost sq" id="dayNext" aria-label="Next day">&rsaquo;</button>
+        <button class="ghost" id="daySet">Set as today</button>
+      </div>
+      <p class="muted small" id="dayNote"></p>
+      <div id="bankList"></div>
+      <div class="soon">Coming soon: post to your Facebook Page in one tap.</div>
+    </main>
+  </section>
+</div>
+
+<!-- Menu (drawer) -->
+<aside id="drawer" class="drawer" hidden>
+  <div class="drawer-scrim" id="scrim"></div>
+  <div class="drawer-panel" role="dialog" aria-label="Menu">
+    <div class="drawer-head">
+      <div class="avatar" aria-hidden="true">M</div>
+      <div><strong>Michael AI</strong><div class="muted small">Your personal assistant</div></div>
+      <button class="icon-btn" id="closeDrawer" aria-label="Close">&times;</button>
+    </div>
+    <nav class="menu">
+      <button id="mNew"><span>✏️</span>New chat</button>
+      <button id="mMemory"><span>🧠</span>Memory: teach Michael AI</button>
+      <button id="mBank"><span>📚</span>Content Bank</button>
+    </nav>
+    <div class="settings">
+      <label class="set-row">Model
+        <select id="modelSel" aria-label="Model">
+          <option value="flash">Flash (best)</option>
+          <option value="lite">Flash-Lite (saves quota)</option>
+        </select>
+      </label>
+      <label class="set-row">Enter key sends <input type="checkbox" id="enterSends" checked></label>
+    </div>
+    <h2 class="hist-h">Chats</h2>
+    <ul id="histList" class="hist"></ul>
+    <div class="drawer-foot">
+      <p class="small muted">Pictures: image making isn't on your free Google key yet. Ask for an "image prompt" and paste it into the Gemini app.</p>
+      <button class="link-btn" id="lockBtn">Lock app</button>
+    </div>
+  </div>
+</aside>
+
+<!-- long-press sheet -->
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-scrim" data-close></div>
+  <div class="sheet-panel" role="dialog" aria-label="Message actions">
+    <button id="sCopy">Copy</button>
+    <button id="sShare">Share…</button>
+    <button id="sWa">Send to WhatsApp</button>
+    <button id="sMem">Save to memory</button>
+    <button data-close class="muted">Cancel</button>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="/app.js?v=3" defer></script>
+</body>
+</html>
