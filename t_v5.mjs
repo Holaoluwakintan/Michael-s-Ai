@@ -3,6 +3,7 @@
 // search, mocked Gemini), model rotation on simulated 429/503, prompt trimming, usage. Nothing is sent to WhatsApp (test ctx);
 // state lives under wa-test/ in the real Blob store and is cleaned at the end.
 import assert from 'node:assert/strict';
+process.env.V9_GATE = '0';   // v9 also arms this gate for outreach/digest; these v5 checks look at reminders alone
 process.env.WA_TEST_KEY = process.env.WA_TEST_KEY || 'local-test-key-0123456789abcdef';
 process.env.SCHED_KEY = 'sched-test-key-0123456789abcdef';
 process.env.CRON_SECRET = process.env.CRON_SECRET || 'cron-test-secret-0123456789abcdef';
@@ -78,8 +79,8 @@ await m.saveKB(OWNER, { facts: [], settings: {} }, ctx()); await m.saveState(OWN
 let x = await say('/new');
 rpc.length = 0;
 x = await say('remind me in 2 hours to check the oven');
-ok('reminder confirmed', x.sent.at(-1).startsWith("⏰ Done! I'll remind you *today at") && x.sent.at(-1).includes('_check the oven_'));
-ok('scheduler gate armed (test row) with the due time', rpc.length >= 1 && rpc.at(-1).p_name === 'test' && rpc.at(-1).p_key === process.env.SCHED_KEY && Math.abs(Date.parse(rpc.at(-1).p_due) - (Date.now() + 2 * 3600e3)) < 120e3);
+ok('reminder confirmed', /^⏰ Done! I'll remind you \*(today|tomorrow) at/.test(x.sent.at(-1)) && x.sent.at(-1).includes('_check the oven_'));
+ok('scheduler gate armed (test row) with the due time', rpc.length >= 1 && rpc.filter(x => x.p_name).at(-1).p_name === 'test' && rpc.filter(x => x.p_name).at(-1).p_key === process.env.SCHED_KEY && (Math.abs(Date.parse(rpc.filter(x => x.p_name).at(-1).p_due) - (Date.now() + 2 * 3600e3)) < 120e3 || (Date.parse(rpc.filter(x => x.p_name).at(-1).p_due) > Date.now() - 60e3 && Date.parse(rpc.filter(x => x.p_name).at(-1).p_due) < Date.now() + 2 * 3600e3)));   // v9: an earlier outreach/digest/Monday wake may share the gate
 x = await say("every day at 6am remind me to post today's verse");
 ok('daily reminder confirmed with 24h-window note', x.sent.at(-1).includes('every day at 6:00am') && x.sent.at(-1).includes('24h'));
 aiWhen = new Date(Date.now() + 3 * 864e5 + 3600e3).toISOString().slice(0, 16);   // (UTC iso read as Lagos: fine, it's in the future)

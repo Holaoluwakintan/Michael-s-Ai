@@ -18,9 +18,13 @@ import { waitUntil } from '@vercel/functions';
 import { get as blobGet, put as blobPut } from '@vercel/blob';
 import SYSTEM from './_prompt.js';
 import PROFILE from './_profile.js';
+import * as V93 from './_v93.js';
+import * as V95 from './_v95.js';
+import * as V96 from './_v96.js';   // v9.6: deeper coding + image rules, code model chain (pro first), format notes   // v9.5: coding + image-prompt skills, picture feedback loop, face rule, fenced splitting
 import * as F from './_files.js';
 import { detectRead, fetchPage, blockedReply, summaryPrompt, factsPrompt, parseFacts, SAVE_RE, SAVE_ONLY_RE, SAVE_TAIL, detectImage, generateImage, imageQuota, countImage, primaryProvider, providerList } from './_extras.js';
 import * as V from './_v5.js';
+import * as V9 from './_v9.js';
 import * as J from './_jobs.js';
 import * as G from './_gem.js';
 import * as B from './_backend.js';
@@ -28,6 +32,7 @@ import * as R from './_research.js';
 import * as GR from './_repo.js';
 import * as SOW from './_sow.js';
 import { parseMediaCmd } from './_mediacmd.js';
+import * as SPING from './_sowping.js';             // v9.2: "Sow just posted" pings (sow pings on/off)
 import * as SP from './_sowplus.js';               // v8: sow · sow week · posted <platform> · sow <day> · add a post for <when> about <topic>
 import * as R8 from './_remind8.js';                // v8: several times in one reminder, clarification answers, no fake "I've set it"
 import * as PV from './_providers.js';             // v8: Groq / OpenRouter free models beside Gemini (only when their keys are set)
@@ -125,7 +130,7 @@ export async function loadState(num, ctx = liveCtx()) {
   return { history: s.history || [], memory: s.memory || [], seen: s.seen || [], cool: s.cool || {}, migrated: !!s.migrated, pending: s.pending || null, lastIn: s.lastIn || 0, lastRead: s.lastRead || null, img: s.img || null, lastImage: s.lastImage || null,
     usage: s.usage || null, jobsUntil: s.jobsUntil || 0, sc: s.sc || [], lastQA: s.lastQA || null, keeperFor: s.keeperFor || null, schedNext: s.schedNext ?? null,
     lastMedia: s.lastMedia || null, sowLast: s.sowLast || [], nlPending: s.nlPending || null,
-    brain: s.brain || null, lastBrain: s.lastBrain || null, remPending: s.remPending || null };   // v8: per-key strong/lite counts for routing + last retrieval
+    brain: s.brain || null, lastBrain: s.lastBrain || null, remPending: s.remPending || null, remPendingReasked: s.remPendingReasked || false, lastPolish: s.lastPolish || null };   // v8: per-key strong/lite counts for routing + last retrieval
 }
 export async function saveState(num, s, ctx = liveCtx()) {
   s.history = (s.history || []).slice(-MAX_TURNS * 2);
@@ -145,7 +150,7 @@ export async function saveKB(num, kb, ctx = liveCtx()) {
 
 // ---------- formatting ----------
 export function toWhatsApp(md) {
-  let t = String(md || '').replace(/\r\n/g, '\n');
+  let t = V96.tablesToLists(String(md || '').replace(/\r\n/g, '\n'));   // v9.6: no tables on WhatsApp
   const blocks = [];
   t = t.replace(/```[\s\S]*?```/g, m => { blocks.push(m.replace(/```[a-zA-Z0-9_+-]*\n/, '```\n')); return `\u0000B${blocks.length - 1}\u0000`; });
   const inl = [];
@@ -164,6 +169,7 @@ export function toWhatsApp(md) {
   return t.replace(/\n{3,}/g, '\n\n').trim();
 }
 export function splitText(t, max = SPLIT_AT) {
+  if (String(t || '').includes('```')) return V95.splitFenced(t, max);   // v9.5: never cut a code block in half
   const out = [];
   let rest = t;
   while (rest.length > max) {
@@ -203,6 +209,10 @@ export async function sendText(to, text, ctx = liveCtx()) {
     if (!last.ok) break;
   }
   return last;
+}
+// v9: an approved template (people outside WhatsApp's 24h window); params fill {{1}}, {{2}}… in the body
+export async function sendTemplate(to, name, lang, params, ctx = liveCtx()) {
+  return graph(phonePath(), { messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'template', template: { name, language: { code: lang }, components: [{ type: 'body', parameters: params.map(t => ({ type: 'text', text: String(t) })) }] } }, ctx);
 }
 // v4: upload bytes to /PHONE_ID/media, then send an image message (caption up to 1024 chars)
 export async function uploadMedia(bytes, mime, ctx = liveCtx(), filename = null) {
@@ -305,13 +315,15 @@ const LEAN_SYSTEM = VOICE_START > 0 && ABIL_START > VOICE_START
   ? SYSTEM.slice(0, VOICE_START) + '# VOICE PACK\n(Left out of this chat turn to save space. If he asks you to write public content as him, write warmly in first person, faith-first, short lines, and suggest "post: <topic>" for a full draft in his voice.)\n\n' + SYSTEM.slice(ABIL_START)
   : SYSTEM;
 export function systemText(facts, opts = {}) {
-  const lean = opts.lean && !V.needsVoice(opts.query);
+  const voice = V.needsVoice(opts.query);
+  const lean = opts.lean && !voice;
   let kbFacts = facts, omitted = 0;
-  if (lean) ({ facts: kbFacts, omitted } = V.relevantFacts(facts, opts.query));
+  // v9.3: with a question, send the most relevant taught facts (topic + keywords + pinned + newest), not all/oldest-first
+  if (opts.query) ({ facts: kbFacts, omitted } = V93.pickFacts(facts, opts.query, lean ? V93.LEAN_BUDGET : V93.FULL_BUDGET, { voice }));
   const now = new Date();
   const day = now.toLocaleDateString('en-GB', { timeZone: 'Africa/Lagos', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
   const time = now.toLocaleTimeString('en-GB', { timeZone: 'Africa/Lagos', hour: '2-digit', minute: '2-digit' });
-  return (lean ? LEAN_SYSTEM : SYSTEM) + WA_RULES + PA_RULES + `\n\n# NOW\nToday is ${day}, ${time} in Nigeria (Africa/Lagos).\n`
+  return (lean ? LEAN_SYSTEM : SYSTEM) + WA_RULES + PA_RULES + V9.ethicBlock() + V93.SKILLS_RULES + V95.SKILLS_V95 + V96.SKILLS_V96 + `\n\n# NOW\nToday is ${day}, ${time} in Nigeria (Africa/Lagos).\n`
     + '\n\n# BASE PROFILE (seeded facts about Michael; a taught fact wins if they conflict)\n' + PROFILE + knowledgeBlock(kbFacts)
     + (omitted ? `- (${omitted} other taught facts not shown here because they don't look related to this message)\n` : '');
 }
@@ -349,37 +361,40 @@ export async function askGemini(history, facts, userParts, started, opts = {}) {
   const chain = opts.chain || CHAIN;
   const track = opts.track || null;                            // v5: the chat state, for per-model usage counts
   const contents = [...historyContents(history), { role: 'user', parts: userParts }];
-  const sys0 = (opts.system || systemText(facts, opts.lean ? { lean: true, query: opts.query } : {}) + R8.ACTION_RULES) + (opts.extra || '');
+  const sys0 = (opts.system || systemText(facts, { lean: !!opts.lean, query: opts.query }) + R8.ACTION_RULES) + (opts.extra || '');
   const sysFor = model => sys0 + (opts.deep && !BR.isStrong(model) ? BR.DEEP_RULES : '');   // v8: Lite answering a hard question thinks step by step
   let lastStatus = 0, quota = false;
   const tried = [];
   const now = Date.now();
   let order = chain.filter(m => !(cool[m] > now));
   if (!order.length) order = [...V.GEMMA, ...chain.slice(-2)];  // everything parked: still try the big-quota models
-  let first = true;
+  let first = true, fastFail = false;
   for (const model of order) {
     const spent = Date.now() - started;
     if (spent > 44000) break;
+    const t0m = Date.now();                                    // v9.6: a fast refusal (pro 429 'limit: 0', a 404) keeps the long first-model budget
+    if (!first && fastFail) first = true;
+    fastFail = false;
     if (PV.isProvider(model)) {                              // v8: OpenAI-compatible providers (text only)
       if (opts.media || userParts.some(p => p.inline_data)) continue;
-      const budget = Math.max(3000, Math.min(first ? 25000 : 15000, 52000 - (Date.now() - started)));
+      const budget = Math.max(3000, Math.min(first ? (opts.firstMs || 25000) : 15000, 52000 - (Date.now() - started)));
       const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), budget);
       let pr;
-      try { pr = await PV.chat(model, sysFor(model), contents, { maxTokens: opts.maxTokens || 2048, signal: ctl.signal }); }
+      try { pr = await PV.chat(model, sysFor(model), contents, { maxTokens: opts.maxTokens || 2048, temperature: opts.temperature ?? 0.7, signal: ctl.signal, ...(/:heavy$/.test(model) ? { sysMax: 40000 } : {}) }); }
       catch (e) { clearTimeout(timer); cool[model] = Date.now() + 3 * 60e3; tried.push(model + ':timeout'); first = false; continue; }
       clearTimeout(timer);
       if (pr.ok) { if (track) { V.bumpModel(track, model); BR.noteCall(track, model, null); } tried.push(model + ':ok'); return { ok: true, text: pr.text, model, provider_model: pr.model, cool, tried }; }
       if (track) BR.noteCall(track, model, null, false);
       if (pr.status === 429) { quota = true; cool[model] = coolUntil(pr.errText); }
       else if (pr.status !== 415) cool[model] = Date.now() + (pr.status === 401 || pr.status === 403 ? 6 * 3600e3 : 5 * 60e3);
-      lastStatus = pr.status; tried.push(model + ':' + pr.status); first = false; continue;
+      lastStatus = pr.status; tried.push(model + ':' + pr.status); fastFail = Date.now() - t0m < 2500; first = false; continue;
     }
     const gemma = V.isGemma(model);
     for (const thinking of [true, false]) {
-      const body = { systemInstruction: { parts: [{ text: sysFor(model) }] }, contents, generationConfig: { temperature: 0.8, maxOutputTokens: opts.maxTokens || 4096 } };
-      if (thinking) body.generationConfig.thinkingConfig = { thinkingLevel: gemma ? 'minimal' : (opts.deep && !BR.isStrong(model) ? 'medium' : 'low') };
+      const body = { systemInstruction: { parts: [{ text: sysFor(model) }] }, contents, generationConfig: { temperature: opts.temperature ?? 0.8, maxOutputTokens: opts.maxTokens || 4096 } };   // v9.5: code asks run cooler
+      if (thinking) body.generationConfig.thinkingConfig = { thinkingLevel: gemma ? 'minimal' : (opts.thinking || (opts.deep && !BR.isStrong(model) ? 'medium' : 'low')) };   // v9.5: code asks think harder
       // v5: short per-model timeouts so a busy (503) or slow model can't eat the whole reply budget
-      const budget = Math.max(3000, Math.min(first ? 25000 : 15000, 52000 - (Date.now() - started)));
+      const budget = Math.max(3000, Math.min(first ? (opts.firstMs || 25000) : 15000, 52000 - (Date.now() - started)));
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), budget);
       let r;
@@ -411,6 +426,7 @@ export async function askGemini(history, facts, userParts, started, opts = {}) {
       tried.push(model + ':' + r.status);
       break;                                                 // 400 / 404 / 5xx -> next model
     }
+    fastFail = Date.now() - t0m < 2500;
     first = false;
   }
   return { ok: false, status: lastStatus, quota, cool, tried };
@@ -422,6 +438,7 @@ export const HELP = [
   '🧠 teach: <fact> · /knowledge · /unteach 3 · /profile · /new',
   '🧠 brain · learn <text or link> · learned · unlearn <n>',
   '⏰ remind me at 5pm to … · reminders',
+  '📣 outreach · contacts · autoreply · goals',
   '🌍 search: <q> · read: <link> · research <topic> (report + PDF)',
   '📄 *Files*: send PDF/Word/Excel · *full text*',
   '🎨 image: <your idea>',
@@ -498,10 +515,13 @@ export function command(text, state, kb) {
     return { reply: `Got it ✅ I'll remember: _${fact}_`, saveKB: true };
   }
   if (low === 'teach' || low === '/teach') return { reply: 'Send *teach:* and the fact, e.g.\n_teach: my ebook price is ₦2,000_' };
+  const kv93 = low.match(/^\/?(?:knowledge|facts)\s+(all|about|prefs|goals|voice|growth|copy|author|faith|tech|projects|other)$/);   // v9.3
+  if (kv93 && kb.facts.length) return { reply: V93.knowledgeView(kb.facts, kv93[1], { max: 60000 }) };
   if (['/knowledge', 'knowledge', '/memory', 'memory', '/facts'].includes(low)) {
     const head = `📌 *Base profile* (built in, can't be deleted): who you are, your apps, channels, priorities and to-dos. Send /profile to read it.`;
     if (!kb.facts.length) return { reply: `${head}\n\n🧠 *Taught facts*: none yet. Try:\n_teach: my ebook price is ₦2,000_` };
     const autoN = kb.facts.filter(f => f.auto).length;      // v8: 📝 = picked up automatically from our chats
+    if (kb.facts.length > 25) return { reply: `${head}\n\n` + V93.knowledgeView(kb.facts) + '\n\nSend *knowledge all* for the full list, or *knowledge <topic>* (e.g. knowledge faith). Remove one with /unteach and its number.' };   // v9.3
     return { reply: `${head}\n\n🧠 *What you've taught me*\n` + kb.facts.map((f, i) => `${i + 1}. ${f.auto ? '📝 ' : ''}${f.t}`).join('\n') + '\n\nRemove one with /unteach and its number.' + (autoN ? `\n_📝 = picked up from our chats by itself (${autoN})._` : '') };
   }
   const un = low.match(/^\/(?:unteach|forget)\s*#?(\d+)$/);
@@ -582,7 +602,8 @@ export async function deliverDue(owner, state, kb, ctx, now = Date.now(), { wind
   return { changed, sent, missed, keeper: keeperSent, window_open: open };
 }
 async function syncSched(state, kb, ctx, { force = false } = {}) {
-  const t = V.nextWake(kb, state.lastIn, state.keeperFor) || null;
+  let t = V.nextWake(kb, state.lastIn, state.keeperFor) || null;
+  if (kvOn() && process.env.V9_GATE !== '0') { try { const t9 = await V9.nextDue(ctx.ns); if (t9 && (!t || t9 < t)) t = t9; } catch (e) { log('v9 next due failed', e.message); } }   // v9: outreach / digest / Monday nudge share the gate
   if (!force && t === (state.schedNext ?? null)) return;
   const r = await V.setNextWake(ctx.test ? 'test' : 'live', t);
   if (r.ok) state.schedNext = t; else if (!r.off) log('scheduler sync failed', r.status || r.detail);
@@ -594,6 +615,7 @@ export async function runReminders(ctx = liveCtx(), { now = Date.now() } = {}) {
   if (!owner) return { skipped: 'no_owner' };
   const [state, kb] = await Promise.all([loadState(owner, ctx), loadKB(owner, ctx)]);
   const r = await deliverDue(owner, state, kb, ctx, now);
+  if (kvOn() || ctx.test) { try { r.v9 = await V9.tick(ctx.ns, owner, v9Deps(ctx, kb.facts || []), { now }); } catch (e) { log('v9 tick failed', e.message); r.v9 = { error: e.message }; } }   // v9: daily outreach drafts, Monday growth, 8pm digest
   const before = state.schedNext ?? null;
   await syncSched(state, kb, ctx, { force: true });
   if (r.changed || (state.schedNext ?? null) !== before) await Promise.all([saveState(owner, state, ctx), r.changed ? saveKB(owner, kb, ctx) : null]);
@@ -606,6 +628,7 @@ export async function onFailedStatus(st, ctx = liveCtx()) {
     const f = (await readJson(`${ctx.ns}/failed-status.json`)) || [];
     await writeJson(`${ctx.ns}/failed-status.json`, [...f, { id: st.id, code: st.errors?.[0]?.code || null, title: String(st.errors?.[0]?.title || '').slice(0, 120), at: new Date().toISOString() }].slice(-20));
   } catch {}
+  try { const o = await V9.onStatusFail(st, ctx, v9Deps(ctx)); if (o) return o; } catch (e) { log('v9 status check failed', e.message); }   // v9: an outreach message that failed later
   const kb = await loadKB(owner, ctx);
   const r = (kb.reminders || []).find(x => x.waId && x.waId === st.id);
   if (!r) return { ignored: 'not_a_reminder' };
@@ -679,12 +702,33 @@ async function strangerNotice(from, msgId, ctx) {
   return { reply: PRIVATE_LINE, ignored: 'not_allowed', sent: r.ok };
 }
 
+// v9: what the outreach / auto-reply / growth module needs from here
+export function v9Deps(ctx, kbFacts = null) {
+  const owner = ALLOWED()[0];
+  const ownerOpen = async () => { const st = await loadState(owner, ctx); return Boolean(st.lastIn && Date.now() - st.lastIn < V.WINDOW_MS - 60e3); };
+  const factsP = kbFacts ? Promise.resolve(kbFacts) : loadKB(owner, ctx).then(k => k.facts || []).catch(() => []);
+  return {
+    test: !!ctx.test, ctx, owner, sendTemplate, _facts: kbFacts || [], fmt: toWhatsApp, profile: PROFILE,
+    sendText: (to, text, c = ctx) => sendText(to, text, c),
+    ask: async (prompt, system, maxTokens = 1000) => askGemini([], await factsP, [{ text: prompt }], Date.now(), { cool: {}, chain: CHAIN, maxTokens, ...(system ? { system } : {}), src: 'v9' }),
+    askContact: async (hist, text, system) => askGemini(hist, [], [{ text }], Date.now(), { cool: {}, chain: LITE_FIRST, maxTokens: 2048, system, src: 'v9-contact' }),
+    ownerOpen,
+    toOwner: async (text) => { if (await ownerOpen()) { const r = await sendText(owner, text, ctx); if (r.ok) return 'sent'; } await V9.queueOwner(ctx.ns, text); return 'queued'; },
+    get facts() { return this._facts || []; },
+  };
+}
+
 export async function processMessage(msg, contactName, ctx = liveCtx()) {
   const started = Date.now();
   const from = String(msg.from || '').replace(/\D/g, '');
   if (seenHere.has(ctx.ns + msg.id)) { log('duplicate (memory)', msg.id); return { ignored: 'duplicate' }; }
   seenHere.add(ctx.ns + msg.id);
-  if (!ALLOWED().includes(from)) { log('message from a number not on WA_ALLOWED'); return strangerNotice(from, msg.id, ctx); }
+  if (!ALLOWED().includes(from)) {                         // v9: other people -> contact list + selective auto-reply (+ owner notice)
+    if (!kvOn() && !ctx.test) { log('message from a number not on WA_ALLOWED'); return strangerNotice(from, msg.id, ctx); }
+    const D = v9Deps(ctx);
+    D._facts = await loadKB(ALLOWED()[0], ctx).then(k => k.facts || []).catch(() => []);
+    return V9.onContactMessage(msg, contactName, ctx, D);
+  }
   if (!ctx.test && !DRY() && (!process.env.WA_TOKEN || !process.env.WA_PHONE_ID)) {
     log('WA_TOKEN / WA_PHONE_ID not set yet: message received but no reply can be sent'); return { ignored: 'no_token' };
   }
@@ -702,6 +746,19 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   const notice = V.missedNotice(kb);
   if (notice) { kbDirty = true; await sendText(from, notice, ctx); }
   const dd = await deliverDue(from, state, kb, ctx, Date.now(), { windowOpen: true, keeper: false });
+  const D9 = v9Deps(ctx, kb.facts || []);
+  if (from === ALLOWED()[0]) { try { await V9.flushQueue(ctx.ns, D9); } catch (e) { log('v9 queue flush failed', e.message); } }   // v9: drafts/digests that waited for his window
+  // v9.1: a newsletter preview that waited for his window (shut at 20:00 Lagos) goes out now; not when he's answering it with skip/unskip
+  if (from === ALLOWED()[0] && J.jobsOn()) {
+    const tb = msg.type === 'text' ? String(msg.text?.body || '') : '';
+    if (!(NL.SKIP_RE.test(tb) || NL.UNSKIP_RE.test(tb))) { try { const fp = await NL.flushPreview(ctx, { sendText, owner: from }); if (fp) { log('nl preview flush', JSON.stringify(fp)); if (ctx.test) ctx.nlFlush = fp; } } catch (e) { log('nl preview flush failed', e.message); } }
+  }
+  // v9.2: Sow pings that waited for his window go out now as one summary (not when he's switching pings off)
+  if (from === ALLOWED()[0] && J.jobsOn()) {
+    const tb = msg.type === 'text' ? String(msg.text?.body || '') : '';
+    const pc = SPING.detect(tb);
+    if (!(pc && pc.op === 'off')) { try { const fh = await SPING.flushHeld(ctx, { sendText, owner: from }); if (fh) { log('sow ping flush', JSON.stringify(fh)); if (ctx.test) ctx.spFlush = fh; } } catch (e) { log('sow ping flush failed', e.message); } }
+  }
   if (dd.changed) kbDirty = true;
 
   const finish = async (reply, userText, modelText) => {
@@ -728,6 +785,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   // ---------- v5: reminders ----------
   const reminderFlow = async (pr, ut) => {
     let p = pr;
+    if (!p.ok && p.ai && !V93.hasWhen(ut)) p = { ok: false, ask: '⏰ When should I remind you? e.g. _8pm_, _tomorrow 7am_, _in 2 hours_, or several: _7pm, 8pm and 9pm_' };   // v9.3: no time said -> ask, never guess one
     if (!p.ok && p.ai) {                                     // rules couldn't read the time: ask Gemini (Lite first) once
       const ans = await askGemini([], [], [{ text: V.reminderAIPrompt(ut) }], started, { cool: state.cool, track: state, chain: LITE_FIRST, maxTokens: 300, system: 'You turn reminder requests into JSON. Output only JSON.' });
       state.cool = Object.fromEntries(Object.entries(ans.cool || {}).filter(([, v]) => v > Date.now()));
@@ -952,6 +1010,8 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
 
   // ---------- v4: make a picture ----------
   const imageFlow = async (req, ut) => {
+    if (req.prompt && V96.realPerson(req.prompt)) return finish(V96.REAL_PERSON_REPLY, ut, 'I explained I never make AI pictures of real public figures and offered a scene without them.');   // v9.6
+    if (req.prompt && (V95.selfFace(req.prompt) || V96.selfFace96(req.prompt))) return finish(V95.SELF_FACE_REPLY, ut, 'I explained I never draw his face with AI (his photos come from his picture bank) and offered a background without him.');   // v9.5
     if (!req.prompt || req.prompt.length < 3) return finish('Tell me what to draw after *image:*, e.g.\n_image: a felt lamb resting in a yarn meadow at sunrise_\nAdd *status*, *square* or *landscape* for other sizes.', null, null);
     const q = imageQuota(state);
     if (!q.left) return finish(`🎨 That's today's ${q.limit} free pictures used up. The count resets at midnight US Pacific time (8–9am Nigeria time). I can still chat, read links and help you write.`, ut, null);
@@ -969,10 +1029,11 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     if (!up.ok) return finish(`I made the picture but WhatsApp didn't accept the upload 😕 (${String(up.detail).slice(0, 120)}). Try again.`, ut, null);
     countImage(state);
     const left = imageQuota(state).left;
-    const caption = `🎨 ${req.prompt.slice(0, 300)}\n\n_${left} free picture${left === 1 ? '' : 's'} left today. To post it: post: <topic> with this image_`;
+    const textTip = /\b(poster|flyer|thumbnail|banner|graphic|cover|invitation|invite|card|verse)\b/i.test(req.prompt) ? '\n_It comes without words so spelling stays perfect: add your headline or verse on top in Canva._' : '';   // v9.3
+    const caption = `🎨 ${(req.change ? `Redrawn: ${req.change}` : req.prompt).slice(0, 300)}${textTip}${V95.peopleNote(req.prompt)}\n\n_${left} free picture${left === 1 ? '' : 's'} left today. To post it: post: <topic> with this image_`;
     const sent = await sendImage(from, up.id, caption, ctx);
     if (!sent.ok && !sent.dry) return finish('I made the picture but couldn\'t send it 😕 Please try again.', ut, null);
-    state.lastImage = { mediaId: up.id, prompt: req.prompt.slice(0, 500), provider: img.provider, at: Date.now() };
+    state.lastImage = { mediaId: up.id, prompt: req.prompt.slice(0, 500), base: req.prompt.slice(0, 900), width: req.width, height: req.height, shape: req.shape, provider: img.provider, at: Date.now() };   // v9.5: size + base kept for "again / brighter"
     state.lastIn = now();
     state.history.push({ role: 'user', text: ut, at: now() });
     state.history.push({ role: 'model', text: `[I made and sent Michael a picture: ${req.prompt.slice(0, 300)}]`, at: now() });
@@ -1145,6 +1206,13 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       const rq = R.detectResearch(t);
       if (rq) return startJob('research', { brief: rq.topic.slice(0, 300), topic: rq.topic, pdf: rq.pdf }, +(process.env.RESEARCH_DAILY_LIMIT || 6), ['research'],
         id => `On it 🔎 Deep research: _${rq.topic.slice(0, 140)}_\nI'll run ~10 searches, read the best pages and send a summary with sources${rq.pdf ? ' + a PDF report' : ''}. 3–6 min.\n_Job #${id}_`);
+      // --- v9.2: sow pings on | off | status (before Sow posts: "sow pings off" must never become a post) ---
+      const spp = SPING.detect(t);
+      if (spp) {
+        if (!isOwner) return finish('Only Michael can change Sow pings on this line.', null, null);
+        try { return finish(await SPING.command(ctx, spp.op, {}), null, null); }
+        catch (e) { log('sow pings cmd failed', e.message); return finish('Couldn\'t change Sow pings just now. Try again in a minute.', null, null); }
+      }
       // --- Sow posts ---
       const pq = SOW.detectPost(t, { pending: !!state.pending });
       if (pq) {
@@ -1217,6 +1285,20 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   let userParts, userText, media = false;
   if (msg.type === 'text') {
     userText = msg.text?.body || '';
+    if (from === ALLOWED()[0]) {                             // v9: outreach / contacts / auto-reply / goals commands, voice polish follow-ups
+      const v9 = await V9.ownerCommand(userText, ctx, D9, from).catch(e => { log('v9 command failed', e.message); return null; });
+      if (v9) return finish(v9, null, null);
+      if (state.lastPolish && Date.now() - state.lastPolish.at < 30 * 60e3 && V9.POLISH_FOLLOW_RE.test(userText)) {
+        const ask = /^\s*(polish( it)?|clean (it|this) up|send-?ready)\s*[.!?]*\s*$/i.test(userText) ? 'polish' : userText;
+        const base = ask === 'polish' ? (state.lastPolish.transcript || state.lastPolish.text) : state.lastPolish.text;
+        const ans = await askGemini([], [], [{ text: V9.polishPrompt(base, ask) }], started, { cool: state.cool, track: state, chain: CHAIN, maxTokens: 4096, system: 'You edit Michael\'s own words into clean, send-ready text without changing his voice or meaning. Output only the text.', src: 'polish' });
+        if (!ans.ok) return finish('I couldn\'t redo it just now 😕 Try again in a minute.', null, null);
+        const done = toWhatsApp(ans.text.trim());
+        state.lastPolish = { ...state.lastPolish, text: done, at: Date.now() };
+        await sendText(from, '✍️ Here it is 👇', ctx);
+        return finish(done, userText, done);
+      }
+    }
     if (/^\s*\/?(?:usage|quota|limits?|my usage|today'?s usage)\s*[?.!]*\s*$/i.test(userText)) {   // v7: chat counts + every AI call today (jobs, sites) from Supabase
       const q = imageQuota(state);
       let extra = '';
@@ -1344,11 +1426,18 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       const req = state.remPending.text; state.remPending = null;           // v8: "the three time" / "8pm" answers the reminder question
       const res = R8.resolveAnswer(req, userText);
       if (res) return reminderFlow(res, `${req} → ${userText}`);
+      if (!state.remPendingReasked) {                          // v9.3: an answer we can't turn into a time -> ask once more, never guess or chat
+        state.remPending = { text: req, at: Date.now() }; state.remPendingReasked = true;
+        return finish(`⏰ I need the exact time${/\b(three|all|both|each)\b/i.test(userText) ? 's' : ''} for: _${req.replace(/^\s*(?:please\s+)?(?:set (?:a )?reminders? (?:for|to)|remind me (?:to )?)\s*/i, '').slice(0, 120)}_\nSend them like: _7pm, 8pm and 9pm_ or _tomorrow 7am_.`, null, null);
+      }
     }
+    state.remPendingReasked = false;
     const pr = R8.parseAny(userText);                        // v8: several times in one request first, then the v5 parser
     if (pr) return reminderFlow(pr, userText);
     const im = detectImage(userText);
     if (im) return imageFlow(im, userText);
+    const fb = V95.imageFeedback(userText, state.lastImage, { pending: !!state.pending });   // v9.5: "again" / "brighter" / "make it more Nigerian" right after a picture
+    if (fb) return imageFlow(fb, userText);
     const pm = userText.match(POST_RE);
     if (pm) {
       if (!pm[1].trim()) return finish('Tell me the topic or paste the text after *post:*, e.g.\n_post: Ruth\'s loyalty_', null, null);
@@ -1396,7 +1485,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     if (ctx.test && (msg.audio || msg.voice)?._test_b64 && state.lastMedia.image && Date.now() - state.lastMedia.image.at < 3 * 3600e3) return finish('🎵 Got the audio. Send *make video* to put it on your picture.', null, null);
     try {
       const m = await downloadMedia(msg.audio?.id || msg.voice?.id);
-      userParts = [{ inline_data: { mime_type: m.mime || 'audio/ogg', data: m.data } }, { text: VOICE_NOTE }];
+      userParts = [{ inline_data: { mime_type: m.mime || 'audio/ogg', data: m.data } }, { text: from === ALLOWED()[0] ? V9.VOICE_V9 : VOICE_NOTE }];   // v9: transcript + send-ready version
       userText = '[voice note]'; media = true;
     } catch (e) { log('voice download failed', e.message); return finish('I couldn\'t open that voice note 🙏 Please try again, or type it.', null, null); }
   } else if (msg.type === 'image' && F.READ_CAPTION_RE.test(msg.image?.caption || '')) {   // v5.1: "read this" on a photo of a page
@@ -1420,6 +1509,12 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       userText = `[picture]${cap ? ' ' + cap : ''}`; media = true;
     } catch (e) { log('image download failed', e.message); return finish('I couldn\'t open that picture 🙏 Please send it again.', null, null); }
   } else if (msg.type === 'document') {                     // v5.1: any document goes through the file reader
+    if (from === ALLOWED()[0] && V9.isContactFile(msg.document?.filename, msg.document?.mime_type)) {   // v9: a contacts file -> outreach list
+      try {
+        const m = ctx.test && msg.document?._test_b64 ? { data: msg.document._test_b64 } : await downloadMedia(msg.document?.id);
+        return finish(await V9.importFile(ctx.ns, from, msg.document?.filename || '', msg.document?.mime_type || '', Buffer.from(m.data, 'base64').toString('utf8'), msg.document?.caption || ''), null, null);
+      } catch (e) { log('contacts file failed', e.message); return finish('I couldn\'t open that contacts file 🙏 Please send it again.', null, null); }
+    }
     return fileFlow({ media: msg.document, name: msg.document?.filename || '', mime: msg.document?.mime_type || '', caption: msg.document?.caption || '' });
   } else {
     return finish('I can read text, voice notes, pictures, videos and files (PDF, Word, Excel, PowerPoint, text) for now 🙂', null, null);
@@ -1428,19 +1523,26 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   // v8: route (easy -> Lite, hard -> strong while today's per-key budget lasts, else Lite + step-by-step), pull his own
   // material for this message (letters, books, projects, learn), and pick up durable facts about him in parallel.
   const rt = BR.route(userText, media, state, { cool: state.cool });
-  const voice = V.needsVoice(userText);
-  let extra = '';
+  const rAsk = msg.type === 'text' ? V93.replyAsk(msg, userText) : null;   // v9.3: "reply to this" / a forwarded message -> 3 replies
+  const voice = V.needsVoice(userText) || Boolean(rAsk);
+  let extra = (rAsk ? V93.REPLY_EXTRA(rAsk) : '') + (/\b(remind|reminder|reminders|alarm|alert|set (?:it|them))\b/i.test(userText) || (state.history || []).slice(-4).some(h => /remind/i.test(h.text || '')) ? V93.remindersBlock(V.active(kb), d => V.fmtWhen(d)) : '');   // v9.3
+  const cAsk = msg.type === 'text' && !rAsk ? V96.codeAsk96(userText) : null;   // v9.5: coding asks get a focused checklist + more room
+  const pAsk = msg.type === 'text' && !rAsk && !cAsk && V96.promptAsk96(userText);   // v9.5: image prompt / design-idea asks
+  if (ctx.test) ctx.skill = cAsk ? 'code:' + cAsk : pAsk ? 'image-prompt' : null;
   if (msg.type === 'text' && BR.wantsRetrieval(userText)) {
     try {
-      const rr = await BR.retrieve(userText, { ns: J.nsOf(ctx), voice });
-      extra = BR.brainBlock(rr.hits, { voice });
+      const rr = await BR.retrieve(userText, { ns: J.nsOf(ctx), voice, wide: Boolean(cAsk || pAsk) });   // v9.5: coding / image-prompt asks pull more know-how
+      if (pAsk) rr.hits = V96.filterBrandHits(rr.hits, userText);   // v9.6: brand notes only when that brand is asked for
+      extra += BR.brainBlock(rr.hits, { voice });
       state.lastBrain = { at: Date.now(), n: rr.hits.length, best: rr.best, ms: rr.ms, src: rr.hits.map(h => h.src) };
       if (ctx.test) ctx.brain = { ...state.lastBrain, titles: rr.hits.map(h => h.title) };
     } catch (e) { log('retrieval skipped', e.message); }
   }
+  if (cAsk) extra += V95.CODE_EXTRA(cAsk, userText) + V96.CODE_EXTRA96(cAsk, userText);   // v9.6: the task instructions come last (after the notes)
+  if (pAsk) extra += V95.PROMPT_EXTRA + V96.PROMPT_EXTRA96(userText);
   if (ctx.test) ctx.route = rt;
-  const ansP = askGemini(state.history, kb.facts, userParts, started, { cool: state.cool, track: state, media, chain: BR.chainFor(rt), deep: rt.level === 'hard', extra, lean: !media, query: userText });
-  const memoP = msg.type === 'text' && BR.wantsMemory(userText) ? autoMemory(userText, kb, started) : null;   // beside the answer, not before it
+  const ansP = askGemini(state.history, kb.facts, userParts, started, { cool: state.cool, track: state, media, chain: cAsk ? BR.codeChain() : pAsk ? BR.promptChain(rt) : BR.chainFor(rt), deep: rt.level === 'hard', extra, lean: !media && !rAsk && !cAsk, query: userText, ...(userText === '[voice note]' || cAsk ? { maxTokens: 8192 } : {}), ...(cAsk ? { temperature: 0.3, thinking: 'medium', firstMs: 32000 } : {}) });   // v9: room for transcript + a full article
+  const memoP = msg.type === 'text' && !cAsk && !pAsk && BR.wantsMemory(userText) ? autoMemory(userText, kb, started) : null;   // v9.5: bug reports and design briefs are not facts about him   // beside the answer, not before it
   const ans = await ansP;
   state.cool = Object.fromEntries(Object.entries(ans.cool || {}).filter(([, v]) => v > Date.now()));
   if (!ans.ok) {
@@ -1452,7 +1554,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     return finish(m, null, null);
   }
   log('answered with', ans.model);
-  let modelText = ans.text;
+  let modelText = pAsk ? V96.fixImageLines(V96.scrubInternal(ans.text), V96.selfAskChat(userText)) : cAsk ? V96.scrubInternal(ans.text) : ans.text;   // v9.6
   if (userText === '[voice note]') {
     const taught = voiceTeach(modelText);
     if (taught) {
@@ -1465,13 +1567,25 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       const pr = R8.parseAny(said) || { ok: false, ask: 'When should I remind you? e.g. _7pm_, _tomorrow 8am_, or _7pm, 8pm and 9pm_' };
       return reminderFlow(pr, '[voice note] ' + said);
     }
+    const vp = V9.parseVoice(modelText);                    // v9: transcript + send-ready version (dictation) or transcript + answer (a question)
+    if (vp) {
+      state.lastPolish = { text: vp.polished || vp.transcript, transcript: vp.transcript, at: Date.now() };
+      const tr = `🎙️ _${vp.transcript.replace(/_/g, ' ')}_`;
+      if (vp.polished && !vp.answer) {
+        await sendText(from, V9.voiceHeader(vp), ctx);   // transcript + what was done + unclear words; the clean text follows alone
+        const done = toWhatsApp(vp.polished);
+        return finish(done, '[voice note] ' + vp.transcript, done);
+      }
+      modelText = `${tr}\n\n${vp.answer || ''}`.trim();
+      userText = '[voice note] ' + vp.transcript;
+    }
     const first = modelText.split('\n')[0];
     if (first.startsWith('🎙')) userText = '[voice note] ' + first.replace(/^🎙️?\s*/, '').replace(/^_|_$/g, '');
   }
   // v8: the chat model can't set reminders or send things. A reply that claims it did is turned into the real action
   // (reminder found in this message or the last 20 min) or into an honest line. Never passed on as is.
   const claim = R8.claimsAction(modelText);
-  if (claim && !V.needsVoice(userText)) {
+  if (claim && !rAsk && (!V.needsVoice(userText) || (claim.kind === 'reminder' && /\bremind/i.test(userText)))) {   // v9.3: "remind me … post …" is still checked
     if (claim.kind === 'reminder') {
       const req = R8.recentRequest([...state.history, { role: 'user', text: userText, at: Date.now() }]);
       let res = R8.parseAny(String(userText).replace(/^\[voice note\]\s*/i, ''));
@@ -1569,7 +1683,7 @@ export async function GET(request) {
   const p = u.searchParams;
   if (p.get('health') === '1') {
     const has = k => Boolean(process.env[k]);
-    return Response.json({ ok: true, version: 2, build: 'v8.0', v8: { routing: 'rules: easy -> lite, hard -> strong (gemini-3.6-flash family) while ' + BR.STRONG_PER_KEY() + '/key/day lasts, then lite + step-by-step', strong_per_key: BR.STRONG_PER_KEY(), providers: ['gemini', ...PV.available()], provider_env: ['GROQ_API_KEY', 'OPENROUTER_API_KEY'], keys: G.keys().filter(k => k.v).length, key_env: ['GEMINI_API_KEY', 'GEMINI_API_KEY_2'], retrieval: BR.brainOn() ? 'gemini-embedding-001 768d in supabase pgvector michael_ai.kchunks' : 'off', auto_memory: true, fresh_search: true, vision: 'photos + PDFs/Office via gemini (since v4/v5.1)', cmds: ['brain', 'learn <text|link>', 'learned', 'unlearn <n>', 'sow', 'sow week', 'sow <day>', 'posted <platform>', 'add a post for <when> about <topic>'], sow: SP.sowApiOn() ? 'sow api + sp_posts' : 'sp_posts only (SOW_API_KEY missing)' }, v72: { daily_verse: VS.verseOn() ? 'sow /api/today -> 06:00 Lagos via pg_cron gate row verse (24h window only, once a day)' : 'off (SOW_API_KEY missing)', verse_cmd: ['verse', 'today', 'daily verse'] }, v71: { newsletter: NL.nlOn() ? 'monday & friday letters, 08:00 Lagos via pg_cron gate row newsletter' : 'off (store env missing)', newsletter_mail: NL.mailOn(), newsletter_cmds: ['letters', 'skip', 'unskip', 'subs', 'newsletter <text>'], newsletter_reserve: NL.RESERVE() }, v7: { site_backend: J.jobsOn(), site_data_api: '/api/site-data', payments: B.paymentsOn() ? 'paystack on' : 'built, off (no Paystack keys yet)', repos: GR.repoOn(), repo_branch_prefix: 'mai/', repo_protected: GR.PROTECTED(), research: J.jobsOn(), research_pdf: true, media: 'ffmpeg via /api/media', sow_posts: SOW.sowOn(), gemini_key2: G.keys().filter(k => k.v).length > 1, quota_cmd: true, apk: 'real signed APK via PWABuilder cloud packager (no account), hosted at <site>/app.apk' }, storage: J.jobsOn() ? 'supabase kv (blob read-fallback)' : (has('BLOB_READ_WRITE_TOKEN') ? 'vercel blob' : 'none'), gemini_keys: G.keys().filter(k => k.v).length, agent: J.jobsOn() && has('VERCEL_TOKEN') && has('GEMINI_API_KEY'), jobs: J.jobsOn(), deploy: has('VERCEL_TOKEN'), builds_daily_limit: J.BUILD_DAILY_LIMIT(), agent_tools: ['web_search', 'web_read', 'make_image', 'build_site', 'remember', 'send_update'], job_runner: 'supabase michael_ai.jobs + pg_cron michael-ai-jobs (every minute) + self-chain, 300 s per tick', file_read: true, file_types: ['pdf', 'docx', 'xlsx', 'pptx', 'txt/csv/md/json/html', 'image (photo of a page)'], file_ocr: 'gemini inline (lite-first rotation) for scans/photos, max ' + Math.round(F.MAX_INLINE / 1048576) + ' MB', file_max_mb: Math.round(F.MAX_DOWNLOAD / 1048576), file_text_cap: F.FILE_CAP, reminders: true, scheduler: V.schedOn() ? 'supabase pg_cron (every minute, wakes only when due) + daily vercel cron + on each message' : 'daily vercel cron + on each message (gate env missing)', reminder_tz: 'Africa/Lagos', search: 'keyless: duckduckgo -> bing -> ddg-lite (+ google-news-rss, wikipedia) -> gemini summary with 1-3 sources', search_daily_limit: V.SEARCH_LIMIT(), models: { hard: V.HARD_CHAIN, easy: V.EASY_CHAIN }, usage_cmd: true, kb_limit: KB_LIMIT, multi_teach: true, read_links: true, image_gen: primaryProvider(), image_fallback: providerList().includes('pollinations-free') ? 'pollinations-free (keyless, best-effort)' : 'off', image_providers: providerList(), img_daily_limit: +(process.env.IMG_DAILY_LIMIT || 20), verify_token: has('WA_VERIFY_TOKEN'), wa_token: has('WA_TOKEN'), phone_id: has('WA_PHONE_ID'), app_secret: has('WA_APP_SECRET'), store: has('BLOB_READ_WRITE_TOKEN'), gemini: has('GEMINI_API_KEY'), owner_only: ALLOWED().length > 0, test_key: has('WA_TEST_KEY'), cron_secret: has('CRON_SECRET'), fb_page: fbConfigured(), profile_words: PROFILE.split(/\s+/).length, dry_run: DRY(), graph: process.env.WA_GRAPH_VERSION || 'v26.0' });
+    return Response.json({ ok: true, version: 2, build: V96.BUILD, v96: { patch: V96.PATCH, coding: 'code asks -> ' + BR.codeChain().slice(0, 6).join(' > ') + ' …; temp 0.3, medium thinking, first model 32 s even after a fast pro refusal; complete templates retrieved (3000 chars each)', images: 'format notes (flyer/status/thumbnail/square/book cover/banner), vague-brief default, draw-Michael route', knowhow: ['knowhow:debug-cases', 'knowhow:templates', 'knowhow:code96', 'knowhow:image-formats', 'knowhow:image-examples96', 'knowhow:image-playbook'] }, v95: { coding: 'coding asks -> strong model, checklist (ask for the error, one-line cause, complete files, numbered steps), 8K output, fenced splitting', image_prompts: 'prompt-craft rules + "write me a prompt" -> ready image: lines', image_feedback: 'again / brighter / make it … within 30 min redraws the last picture', face_rule: 'never draws Michael (picture bank)', brand_looks: ['retain', 'nigerian', 'blossom', 'faith', 'thumbnail'], knowhow: ['knowhow:code', 'knowhow:imagecraft', 'voice:*'] }, v93: { retrieval: 'taught facts picked per message (topics + keywords + pinned + newest), lean ' + V93.LEAN_BUDGET + ' / full ' + V93.FULL_BUDGET + ' chars', skills: ['images', 'coding', 'video (honest)', 'reply drafts x3', 'know-how bank (knowhow:* in kchunks)'], knowledge_view: true }, v9: { outreach: true, template: V9.TPL_NAME(), autoreply: true, voice_polish: true, growth_nudge: 'monday 08:00 lagos', digest: '20:00 lagos' }, v8: { routing: 'rules: easy -> lite, hard -> strong (gemini-3.6-flash family) while ' + BR.STRONG_PER_KEY() + '/key/day lasts, then lite + step-by-step', strong_per_key: BR.STRONG_PER_KEY(), providers: ['gemini', ...PV.available()], provider_env: ['GROQ_API_KEY', 'OPENROUTER_API_KEY'], keys: G.keys().filter(k => k.v).length, key_env: ['GEMINI_API_KEY', 'GEMINI_API_KEY_2'], retrieval: BR.brainOn() ? 'gemini-embedding-001 768d in supabase pgvector michael_ai.kchunks' : 'off', auto_memory: true, fresh_search: true, vision: 'photos + PDFs/Office via gemini (since v4/v5.1)', cmds: ['brain', 'learn <text|link>', 'learned', 'unlearn <n>', 'sow', 'sow week', 'sow <day>', 'posted <platform>', 'add a post for <when> about <topic>'], sow: SP.sowApiOn() ? 'sow api + sp_posts' : 'sp_posts only (SOW_API_KEY missing)' }, v72: { daily_verse: VS.verseOn() ? 'sow /api/today -> 06:00 Lagos via pg_cron gate row verse (24h window only, once a day)' : 'off (SOW_API_KEY missing)', verse_cmd: ['verse', 'today', 'daily verse'] }, v92: { sow_pings: 'sow-ng cron -> /api/cron?task=sowping (x-sow-key); window shut -> held, one summary on his next message; fails once/day per platform+reason; cmds sow pings on|off' }, v91: { nl_preview: 'full letter at 20:00 Lagos; window shut -> approved template nudge (' + NL.PREVIEW_TEMPLATES().join(' | ') + ') + held until his next message' }, v71: { newsletter: NL.nlOn() ? 'monday & friday letters, 08:00 Lagos via pg_cron gate row newsletter' : 'off (store env missing)', newsletter_mail: NL.mailOn(), newsletter_cmds: ['letters', 'skip', 'unskip', 'subs', 'newsletter <text>'], newsletter_reserve: NL.RESERVE() }, v7: { site_backend: J.jobsOn(), site_data_api: '/api/site-data', payments: B.paymentsOn() ? 'paystack on' : 'built, off (no Paystack keys yet)', repos: GR.repoOn(), repo_branch_prefix: 'mai/', repo_protected: GR.PROTECTED(), research: J.jobsOn(), research_pdf: true, media: 'ffmpeg via /api/media', sow_posts: SOW.sowOn(), gemini_key2: G.keys().filter(k => k.v).length > 1, quota_cmd: true, apk: 'real signed APK via PWABuilder cloud packager (no account), hosted at <site>/app.apk' }, storage: J.jobsOn() ? 'supabase kv (blob read-fallback)' : (has('BLOB_READ_WRITE_TOKEN') ? 'vercel blob' : 'none'), gemini_keys: G.keys().filter(k => k.v).length, agent: J.jobsOn() && has('VERCEL_TOKEN') && has('GEMINI_API_KEY'), jobs: J.jobsOn(), deploy: has('VERCEL_TOKEN'), builds_daily_limit: J.BUILD_DAILY_LIMIT(), agent_tools: ['web_search', 'web_read', 'make_image', 'build_site', 'remember', 'send_update'], job_runner: 'supabase michael_ai.jobs + pg_cron michael-ai-jobs (every minute) + self-chain, 300 s per tick', file_read: true, file_types: ['pdf', 'docx', 'xlsx', 'pptx', 'txt/csv/md/json/html', 'image (photo of a page)'], file_ocr: 'gemini inline (lite-first rotation) for scans/photos, max ' + Math.round(F.MAX_INLINE / 1048576) + ' MB', file_max_mb: Math.round(F.MAX_DOWNLOAD / 1048576), file_text_cap: F.FILE_CAP, reminders: true, scheduler: V.schedOn() ? 'supabase pg_cron (every minute, wakes only when due) + daily vercel cron + on each message' : 'daily vercel cron + on each message (gate env missing)', reminder_tz: 'Africa/Lagos', search: 'keyless: duckduckgo -> bing -> ddg-lite (+ google-news-rss, wikipedia) -> gemini summary with 1-3 sources', search_daily_limit: V.SEARCH_LIMIT(), models: { hard: V.HARD_CHAIN, easy: V.EASY_CHAIN }, usage_cmd: true, kb_limit: KB_LIMIT, multi_teach: true, read_links: true, image_gen: primaryProvider(), image_fallback: providerList().includes('pollinations-free') ? 'pollinations-free (keyless, best-effort)' : 'off', image_providers: providerList(), img_daily_limit: +(process.env.IMG_DAILY_LIMIT || 20), verify_token: has('WA_VERIFY_TOKEN'), wa_token: has('WA_TOKEN'), phone_id: has('WA_PHONE_ID'), app_secret: has('WA_APP_SECRET'), store: has('BLOB_READ_WRITE_TOKEN'), gemini: has('GEMINI_API_KEY'), owner_only: ALLOWED().length > 0, test_key: has('WA_TEST_KEY'), cron_secret: has('CRON_SECRET'), fb_page: fbConfigured(), profile_words: PROFILE.split(/\s+/).length, dry_run: DRY(), graph: process.env.WA_GRAPH_VERSION || 'v26.0' });
   }
   const want = process.env.WA_VERIFY_TOKEN || '';
   if (p.get('hub.mode') === 'subscribe' && want && p.get('hub.verify_token') === want) {

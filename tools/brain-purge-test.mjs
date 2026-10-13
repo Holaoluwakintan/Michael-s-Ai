@@ -1,0 +1,1 @@
+const BR = await import('../api/_brain.js'); console.log(JSON.stringify(await BR.brainRpc('purge_test', {})));

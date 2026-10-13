@@ -120,13 +120,14 @@ const prov = {
 };
 const sentTexts = [];
 let lastIn = 0;
-const deps = (now, extra = {}) => ({ now, providers: prov, owner: OWNER, loadState: async () => ({ lastIn }), sendText: async (to, t) => { sentTexts.push(t); return { ok: true }; }, setNextWake: async (name, t) => { wakes.push({ p_name: name, p_due: t ? new Date(t).toISOString() : null }); return { ok: true }; }, ...extra });
+const kvStore = new Map(); const tplSent = []; let tplStatus = 'PENDING';
+const deps = (now, extra = {}) => ({ now, providers: prov, kvGet: async k => kvStore.get(k) ?? null, kvPut: async (k, v) => { kvStore.set(k, v); return true; }, templateStatus: async () => ({ status: tplStatus, lang: 'en' }), sendTemplate: async (to, name, lang, params) => { tplSent.push({ to, name, lang, params }); return { ok: true, id: 'wamid.T' }; }, owner: OWNER, loadState: async () => ({ lastIn }), sendText: async (to, t) => { sentTexts.push(t); return { ok: true }; }, setNextWake: async (name, t) => { wakes.push({ p_name: name, p_due: t ? new Date(t).toISOString() : null }); return { ok: true }; }, ...extra });
 const live = { test: false, ns: 'wa', outbox: [] };
 let r = await NL.runNewsletter(live, deps(Date.parse('2026-10-08T10:00:00Z')));
 ok('before the first letter: nothing sent, gate armed for the Sunday 20:00 preview', r.sent === 0 && r.next === '2026-10-11T19:00:00.000Z' && bcast.length === 0);
 lastIn = Date.parse('2026-10-11T09:00:00Z');
 r = await NL.runNewsletter(live, deps(Date.parse('2026-10-11T19:00:00Z')));
-ok('Sunday 20:00 Lagos: preview sent inside the 24h window, gate re-armed for Monday 08:00', r.preview?.how === 'sent' && sentTexts.at(-1).includes("Tomorrow's letter") && sentTexts.at(-1).includes('Gold in the Cracks') && sentTexts.at(-1).includes('*skip*') && r.next === '2026-10-12T07:00:00.000Z');
+ok('Sunday 20:00 Lagos: preview sent inside the 24h window, gate re-armed for Monday 08:00', r.preview?.how === 'sent' && sentTexts.at(-1).includes("Your next letter, for review") && sentTexts.at(-1).includes('Gold in the Cracks') && sentTexts.at(-1).includes('Kintsugi') && sentTexts.at(-1).includes('Jeremiah 30:17') && sentTexts.at(-1).includes('*457* subscribers') && !sentTexts.at(-1).includes('%%') && sentTexts.at(-1).includes('*skip*') && r.next === '2026-10-12T07:00:00.000Z');
 r = await NL.runNewsletter(live, deps(Date.parse('2026-10-11T19:01:00Z')));
 ok('preview goes once', r.preview === null && sentTexts.length === 1);
 r = await NL.runNewsletter(live, deps(Date.parse('2026-10-12T07:00:00Z')));
@@ -142,7 +143,13 @@ const all = bcast.flatMap(b => b.emails);
 ok('nobody twice, nobody missed: 457 unique addresses for letter 1', all.length === 457 && new Set(all).size === 457);
 ok('then the gate waits for Thursday 20:00 (Friday letter preview)', r.next === '2026-10-15T19:00:00.000Z');
 r = await NL.runNewsletter(live, deps(Date.parse('2026-10-15T19:00:00Z')));
-ok('preview skipped when WhatsApp 24h window is shut (no template on the test number)', r.preview?.how === 'window_closed' && sentTexts.length === 1);
+ok('window shut, no approved template: nothing sent at 20:00, preview held for his next message', r.preview?.how === 'window_closed_waiting' && sentTexts.length === 1 && kvStore.get('wa/nl/preview-pending')?.id === db.letters.find(x => x.slot === 2).id && r.template && !r.template.ok);
+{ // v9.1: he messages the bot at 23:00 Lagos -> the held preview goes now, once
+  const fp = await NL.flushPreview(live, { ...deps(Date.parse('2026-10-15T22:00:00Z')) });
+  ok('his next message releases the held preview (full letter), marked sent_on_reply', fp?.sent === true && sentTexts.length === 2 && sentTexts.at(-1).includes('When Life Tears Up Your Script') && sentTexts.at(-1).includes('*skip*') && db.letters.find(x => x.slot === 2).preview_how === 'sent_on_reply');
+  const fp2 = await NL.flushPreview(live, { ...deps(Date.parse('2026-10-15T22:05:00Z')) });
+  ok('a second message does not send it again', fp2 === null && sentTexts.length === 2);
+}
 
 // rotation: day-2 people differ between letters
 credits = 300;

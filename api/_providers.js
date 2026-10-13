@@ -14,9 +14,9 @@ export const PROVIDERS = {
     skip: /whisper|guard|tts|playai|orpheus|prompt-guard|distil|vision|compound/i,
   },
   or: {
-    name: 'OpenRouter', base: 'https://openrouter.ai/api/v1', env: 'OPENROUTER_API_KEY', pin: { strong: 'OPENROUTER_STRONG', fast: 'OPENROUTER_FAST' },
-    defaults: { strong: 'nvidia/nemotron-3-super-120b-a12b:free', fast: 'google/gemma-4-26b-a4b-it:free' },
-    prefer: { strong: [/nemotron-3-super-120b/i, /nemotron-3-ultra/i, /inkling:free$/i, /gemma-4-31b/i, /deepseek|llama-3\.3-70b|qwen.*(72|235)b/i], fast: [/gemma-4-26b/i, /lightning/i, /flash/i, /mini|small|nano/i] },
+    name: 'OpenRouter', base: 'https://openrouter.ai/api/v1', env: 'OPENROUTER_API_KEY', pin: { strong: 'OPENROUTER_STRONG', fast: 'OPENROUTER_FAST', heavy: 'OPENROUTER_HEAVY' },
+    defaults: { strong: 'nvidia/nemotron-3-super-120b-a12b:free', fast: 'google/gemma-4-26b-a4b-it:free', heavy: 'nvidia/nemotron-3-ultra-550b-a55b:free' },
+    prefer: { heavy: [/nemotron-3-ultra/i, /nemotron-3-super-120b/i, /inkling:free$/i, /deepseek|qwen.*(235|480)b/i], strong: [/nemotron-3-super-120b/i, /nemotron-3-ultra/i, /inkling:free$/i, /gemma-4-31b/i, /deepseek|llama-3\.3-70b|qwen.*(72|235)b/i], fast: [/gemma-4-26b/i, /lightning/i, /flash/i, /mini|small|nano/i] },
     skip: /safety|guard|code|omni|embed/i, freeOnly: true,
   },
 };
@@ -25,6 +25,7 @@ export const ORDER = () => (process.env.PROVIDER_ORDER || 'groq,or').split(',').
 export const available = () => ORDER().filter(on);
 export const strongChain = () => available().map(p => `${p}:strong`);
 export const fastChain = () => available().map(p => `${p}:fast`);
+export const heavyChain = () => ['or', 'groq'].filter(p => available().includes(p)).map(p => p === 'or' ? 'or:heavy' : `${p}:strong`);   // v9.6: coding asks: the biggest free model on each provider
 export const isProvider = m => /^(groq|or):/.test(String(m || ''));
 export const providerOf = m => String(m || '').split(':')[0];
 export const SYS_MAX = () => +(process.env.PROVIDER_SYS_MAX || 16000);
@@ -71,10 +72,10 @@ export function toMessages(sys, contents) {
   return msgs;
 }
 // -> { ok, status, text, model, errText }  (never throws on HTTP errors; throws on network/abort like fetch)
-export async function chat(vid, sys, contents, { maxTokens = 2048, temperature = 0.7, signal, fetchImpl = globalThis.fetch } = {}) {
+export async function chat(vid, sys, contents, { maxTokens = 2048, temperature = 0.7, signal, fetchImpl = globalThis.fetch, sysMax } = {}) {
   const p = providerOf(vid); const P = PROVIDERS[p];
   if (!P || !on(p)) return { ok: false, status: 0, errText: 'provider off' };
-  const messages = toMessages(compact(sys), contents);
+  const messages = toMessages(compact(sys, sysMax || SYS_MAX()), contents);
   if (!messages) return { ok: false, status: 415, errText: 'media is Gemini-only' };
   let model = await resolve(vid, { fetchImpl });
   for (let attempt = 0; attempt < 2; attempt++) {

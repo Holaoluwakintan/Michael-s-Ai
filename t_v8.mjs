@@ -264,7 +264,7 @@ ok('posted <platform> -> marks today\'s latest due post on that platform', sowCa
 calls.length = 0;
 x = await say('add a post for Friday 7pm about faith');
 const added = sowRows.at(-1);
-ok('natural "add a post for Friday 7pm about faith" -> written in his voice by AI and queued for that Friday 19:00', added && added.post_time === '19:00:00' && added.post_date === SPm.dateOf('friday') && calls.some(c => c.user.includes('about: faith') && c.sys.includes('# VOICE PACK')) && x.all.includes('Scheduled in *Sow*'));
+ok('natural "add a post for Friday 7pm about faith" -> written in his voice by AI and queued for that Friday 19:00', added && added.post_time === '19:00:00' && (added.post_date === SPm.dateOf('friday') || (new Date(Date.now() + 3600e3).getUTCDay() === 5 && added.post_date === SPm.dateOf('today'))) &&   /* on a Friday, 'Friday 7pm' is tonight */ calls.some(c => c.user.includes('about: faith') && c.sys.includes('# VOICE PACK')) && x.all.includes('Scheduled in *Sow*'));
 x = await say('unpost');
 ok('unpost removes the AI-added post (undo works)', !sowRows.some(r => r.id === added.id) && x.all.includes('Removed'));
 x = await say('sow', OTHER);
@@ -351,7 +351,7 @@ delete process.env.GROQ_API_KEY; delete process.env.OPENROUTER_API_KEY; provMode
 
 // ======================= 7. health =======================
 const h = await (await m.GET(new Request('https://x.test/api/whatsapp?health=1'))).json();
-ok('health: build v8.x with the v8 block (and v7/v7.1 blocks kept)', /^v8\.\d/.test(h.build) && h.v8.auto_memory === true && /pgvector/.test(h.v8.retrieval) && h.v8.key_env.includes('GEMINI_API_KEY_2') && h.v7 && h.v71);
+ok('health: build v8.x with the v8 block (and v7/v7.1 blocks kept)', /^v[89]\.\d/.test(h.build) && h.v8.auto_memory === true && /pgvector/.test(h.v8.retrieval) && h.v8.key_env.includes('GEMINI_API_KEY_2') && h.v7 && h.v71);
 ok('help mentions brain + learn + Sow', m.HELP.includes('brain') && m.HELP.includes('learn <text or link>') && m.HELP.includes('sow week') && m.HELP.includes('posted facebook'));
 ok('health lists the Sow commands', h.v8.cmds.includes('sow week') && h.v8.cmds.includes('posted <platform>'));
 

@@ -1,12 +1,5 @@
 # Michael AI
 
-## Build, run, deploy (added Oct 14 2026)
-- No build step. Static PWA in `public/`, serverless functions in `api/` (Vercel, Node 20). `npm install` only for local tests.
-- Deploy: Vercel project `michael-ai` (hostname michael-ai-mu.vercel.app). Any Vercel deploy of this folder works (`vercel --prod`), or the REST deploy script Tab used.
-- Tests (mocked): `node t_v9.mjs`, `node t_v96.mjs`, ... (see tools/run_all.sh). Some suites use the real store under the `wa-test/` namespace.
-- Env vars (set in Vercel, never in code): GEMINI_API_KEY, GEMINI_API_KEY_2, APP_PASSCODE, WA_TOKEN, WA_PHONE_ID, WA_WABA_ID, WA_VERIFY_TOKEN, WA_APP_SECRET, WA_ALLOWED, WA_TEST_KEY, CRON_SECRET, SB_URL + Supabase key (jobs/kv store), SCHED_KEY, BLOB_READ_WRITE_TOKEN, VERCEL_TOKEN/VERCEL_TEAM_ID (site builder), GITHUB token (repo edits), SOW_API_KEY, BREVO_API_KEY, BROADCAST_SECRET, BROADCAST_URL, GROQ_API_KEY, OPENROUTER_API_KEY, PUBLIC_URL. Copies of the values live in Michael's Vercel project settings.
-- Supabase schema: `sql/` (michael_ai schema: kv, jobs, sched, kchunks pgvector, newsletter).
-
 Private AI assistant for Olaoluwa Michael. Static PWA in `public/` + `api/chat.js` (Gemini). `api/whatsapp.js` is the WhatsApp Cloud API webhook (v2, 6 Oct 2026; v3 same day: 60k knowledge limit + multi-teach; v4 same day: link reading + image generation, code in `api/_extras.js`): Michael's PERSONAL assistant, owner-only.
 
 Storage (private Vercel Blob store `michael-ai-wa`): `wa/<number>.json` = chat history (last 20 turns), dedupe ids, model cool-downs, pending Facebook draft; `wa/<number>.knowledge.json` = taught facts + settings (nudge on/off). `wa/others/<number>.json` = when the private line was last sent to a stranger. Test runs use `wa-test/`.
@@ -191,3 +184,66 @@ tail, `PROVIDER_SYS_MAX` 16,000 chars) for small free-tier token limits. `brain`
 **Health:** build `v8.0` with a `v8` block. **Tests:** `t_v8.mjs` (119 checks mocked; `LIVE=1 GEMINI_LIVE_KEY=… SB_URL/SB_ANON_KEY/SCHED_KEY` adds 5 live
 retrieval checks against the real index). Real-model smoke: `node tools/local-live.mjs '<q1>' '<q2>'` (sandbox ns, nothing sent; PURGE=1 cleans). All older suites unchanged except the build-regex in t_v6/t_v7 (accepts v8).
 **Deploy:** `python3 files/michael-ai/deploy-v8.py` (MAI_SRC defaults to /home/user/work/michael-ai-v8).
+
+
+## v9.0 "replica of Tab" (9 Oct 2026; Michael's voice note 06:03Z)
+Module `api/_v9.js` (store: michael_ai.kv keys `<ns>/v9/cfg|contacts|batch|log|chat-<num>`).
+- **Daily outreach, owner-approved**: at `outreach time` (default 09:00 Lagos) the bot picks 5 random people from the list (people who messaged the bot number + owner-added via `contacts add` / a .vcf or .csv document), skipping anyone messaged in the last 14 days or opted out, drafts a short personal message for each (Gemini, goal-aware; fallback text if AI is down) and sends the 5 drafts to the OWNER only. Approvals: `send all`, `send 1 3`, `edit 2: <text>`, `skip 4`, `redo 5`, `drafts`. Contacts inside the 24h window get free-form text; others get template `michael_checkin_v1` (lang `en`, MARKETING, body "Hi {{1}}, it's Michael 👋 {{2}} …", footer "Reply STOP…"; submitted Oct 9 06:06Z, id 1632050801887578). If the template isn't APPROVED, those drafts are held (never sent) and the owner is told. Failures are explained in plain words (131030 test number, 131047 window, 132001 template, 131026 not on WhatsApp); late failures from the status webhook are reported too. Contacts saying STOP are opted out for good (START re-opts).
+- **Selective auto-reply** for anyone not on WA_ALLOWED (replaces the old "This is a private assistant." line when the kv store is on): `autoreply only <numbers|label>` -> AI answers as "Michael's assistant" (Lite chain, own short history per contact, public business info only, never personal facts, never invents prices/promises); `autoreply except <numbers>` -> never answered; everyone else -> `autoreply unknown hold|silent|answer` (default hold: one polite "Michael will get back to you" per 24h + owner notice, max 1 notice / contact / 30 min). `autoreply all|none|on|off|remove <x>`. Owner answers through the bot: `reply <number>: <text>` (24h window only). Evening digest 20:00 Lagos, or `digest`.
+- **Goals + growth**: `goals` (add/remove/set), injected into every owner prompt; Monday 08:00 Lagos "3 moves" business-coach nudge, or `growth`.
+- **Work ethic**: `V9.ethicBlock()` appended to every owner chat system prompt (act don't ask, never claim done, plain failures, short, point of view, one next step, reminders for anything timed, business-guru stance, goals).
+- **Voice note -> send-ready text** (owner): one Gemini call returns TRANSCRIPT / KIND / INSTRUCTION / POLISHED / UNCLEAR / ANSWER. Dictation: message 1 = transcript + what was done + flagged unclear words; message 2 = the clean text alone (forwardable; an instruction like "write this into an article titled X" is followed, title first, signed _Olaoluwa Michael_). Question: transcript + answer. Follow-ups within 30 min: `shorter`, `more formal`, `as a status`, `for <name>`, `polish`. Old one-line format still handled.
+- **Trigger**: no new pg_cron row needed. The existing gate row `live` (-> /api/cron?task=reminders) now wakes at min(next reminder, next v9 moment) and `runReminders` runs `V9.tick` (claims the day before sending, so one batch a day). Owner window shut -> drafts/digests are queued in cfg.queue and delivered when he next writes. Sandbox: `POST /api/jobs?sandbox=1&v9=1&force=outreach|growth|digest` with x-test-key.
+- Tests: `t_v9.mjs` (100 checks); t_v2/t_v5/t_v6/t_v7/t_v8 assertions loosened for v9 (stranger holding reply, shared gate, build v9, Friday date edge in t_v8).
+
+
+## v9.3 TRAINED (10 Oct 2026, worker 99fe398e; Michael m:f765b47e "Then please train my Ai", m:7f3f7cf2 "Image coding video replying to texts. Banks of thing to know")
+Module `api/_v93.js` (pure helpers). Changes:
+- **His knowledge loaded**: `tools/kb-import-v93.mjs <ns> facts|knowhow|both` imports `files/michael-ai/train-v93/facts-import.json` (95 facts: all 84
+  teach-pack items P1 12 / P2 10 / P3A 15 / P3B 15 / P4 11 / P5 10 / P6 11, with P1.04 merged with the 10 Oct Facebook update, plus 11 dated facts from
+  Tab's notes: short replies, Akure/WAT, December goals, the Facebook million goal, clip bank, Telegram storage, Bible Arena + beta 11 Oct, Sow,
+  Blossom, Monday & Friday Letters, Royal People Care) into `<ns>/2348148034092.knowledge.json` as normal taught facts with `tag`, `src` and `pin`
+  (4 pinned standing facts). Dedupe: exact or token-Jaccard > 0.6 against what's there (his own wins). `/knowledge`, `/unteach N`, `teach:` work as before.
+- **Retrieval**: `V93.pickFacts` chooses the taught facts per message (topic tags matched from the question + keyword overlap with light stemming +
+  two-word names + pinned + newest 5), oldest-first order kept. Budgets: lean chat 9,000 chars, hard/voice 16,000; no query (nudges/jobs) = all.
+  The base profile is still always in. `/knowledge` shows a topic summary once there are >25 facts; `knowledge all`, `knowledge <topic>`.
+- **Know-how bank**: 33 dated reference entries (faith basics, BVN/NIN/transfers/Paystack, reels/YouTube/Facebook reuse rules, freelance pricing,
+  Vercel/Render/Supabase/APK/PWA/WhatsApp API, CapCut/Premiere, image prompts, reply drafting) in `michael_ai.kchunks` src `knowhow:*`, pulled by the
+  same embedding lookup as letters/books; `wantsRetrieval` also fires on know-how words; labelled "reference bank (dated)" in the prompt.
+- **Skills**: `SKILLS_RULES` in every owner prompt (image command lines, code formatting, honest video limits, 3-tone reply drafts, freshest fact first).
+  Reply drafts: "reply to this…" or a FORWARDED message -> exactly 3 replies (*Warm*, *Short*, *Professional*), [blank] placeholders, no invented dates.
+  Images: "make/design a poster|flyer|thumbnail|banner|verse graphic|card … of/for …" now route to the image maker, with Blossom / faith / thumbnail /
+  poster looks added to the prompt and a "add your words in Canva" tip.
+- **Reminders**: a reminder request with no time at all is asked about ("When should I remind you?") instead of the AI guessing 9am; an answer that
+  can't be turned into a time is asked once more; the chat model now sees his real active reminders when reminders are discussed, so "did you set
+  it?" is answered truthfully (v8 already routed "the three time" back to the reminder flow and blocked false claims).
+- Goals: DEFAULT_GOALS += Facebook million goal. Health: build `v9.3`, `v93` block. Tests: `t_v93.mjs` (36 checks); t_v5 clock-edge fix ("in 2 hours"
+  after 22:00 Lagos is tomorrow); t_v92 build regex. NOTE: the mocked suites write and wipe the real `wa-test` kv namespace: re-import before sandbox runs.
+
+
+## v9.5 CODING + IMAGES (12 Oct 2026, worker c503eadc; Michael m:7b382ab1 "just train… especially for coding and image generation")
+- api/_v95.js (pure): SKILLS_V95 (HOW TO THINK + CODING + IMAGES blocks, added after the v9.3 skills in every owner prompt);
+  codeAsk/CODE_EXTRA (error / code / task; vague bug -> ask for the exact error; otherwise one-line cause, complete files, steps, self-check);
+  promptAsk/PROMPT_EXTRA (2-3 ready `image:` lines + Canva words; [blank] for unknown details; made-up lines marked (suggested));
+  imageFeedback ("again", "brighter", "make it more Nigerian", "use RETAIN colours", "in status size" within 30 min of a picture -> redraw);
+  selfFace/SELF_FACE_REPLY (never draws Michael: his photos come from his Telegram picture bank); peopleNote (AI-made people in captions);
+  brandStyle95 (RETAIN palette, Nigerian look; wired into _extras.brandStyle); splitFenced (WhatsApp splitting never cuts a ``` block).
+- whatsapp.js: code asks -> 8K output, temperature 0.3, thinking medium, first model budget 32 s, full fact budget, wide retrieval, no auto-memory;
+  prompt asks -> wide retrieval, no auto-memory. askGemini takes opts.temperature / opts.thinking / opts.firstMs.
+- _brain.js: classify -> hard for code/prompt asks; KNOW_RE + coding/image words; retrieve({ wide }) 6 hits from 14; voice:* chunks lead when writing as him.
+- _v93.js: BUILD v9.5; topic `images` (Images & design) for facts.
+- Knowledge (files/michael-ai/train-v95/): knowhow.json 99 chunks (knowhow:code 33, code-examples 12, debug 12, imagecraft 16, image-examples 10,
+  voice:guide 12, voice:thoughts 4 incl. his NIMC essay verbatim); facts-import.json 7 facts (RETAIN /hrp + /tst, 0703 then 0903, RETAIN colours,
+  face rule (pinned), coding prefs, image sizes, Just Me and My Thoughts pattern). Import: node tools/kb-import-v93.mjs <ns> both --dir=/home/user/tab/files/michael-ai/train-v95
+- Tests: t_v95.mjs (mocked). tools/run_all.sh runs t_v71 on a fixed clock (tools/fake-clock.mjs, FAKE_NOW=2026-10-11T12:00Z): it checks
+  "skip the next letter" and letter 1 went out 12 Oct 07:00Z. tools/wa-test-reset.mjs wipes wa-test (kv + brain) before re-importing for sandbox runs.
+  tools/sandbox-v95.mjs <questions.json> <out.json> runs real-model sandbox Q&As locally in wa-test.
+
+## v9.6 (12 Oct 2026) — coding + images, round 2 (Michael: "dont rush it, make it super super smart like you")
+- Code asks: model chain `gemini-3.1-pro-preview` (free keys answer 429 "limit: 0" -> parked until Google's daily reset; it answers the day billing is on) > `gemini-3.6-flash` > `or:heavy` (OpenRouter's biggest free model, nemotron-3-ultra) > `groq:strong` (gpt-oss-120b) > rest of the Flash family > Lite > fast providers > Gemma. Not limited by the daily strong budget. A fast refusal (<2.5 s) keeps the long first-model budget. `CODE_PRO_MODELS` env overrides/turns off pro ("" = off). Heavy provider calls keep up to 40K chars of system prompt.
+- Image-prompt asks: OpenRouter strong before Groq strong; brand notes (RETAIN/Blossom) are dropped from retrieval unless the ask names that brand.
+- api/_v96.js: SKILLS_V96 (wrong assumptions, never invent, diagnose/rank causes, long pasted code, his projects' gotchas, add-only edits to existing files, Hobby 12 functions / daily crons, formats, vague briefs, drawing Michael), CODE_EXTRA96 + CODE_TAIL and PROMPT_EXTRA96 + IMAGE_TAIL (short rules in the per-message tail, because providers get a trimmed prompt), codeAsk96/promptAsk96 (wider detection), realPerson guard (no AI pictures of named public figures), selfFace96, tablesToLists (Markdown tables -> WhatsApp lists), filterBrandHits.
+- Retrieval: wide asks (code / image prompt) get 3000 chars per note (complete templates).
+- Knowledge (kchunks src): knowhow:debug-cases 42, knowhow:templates 18, knowhow:code96 4, knowhow:image-formats 6, knowhow:image-examples96 24, knowhow:image-playbook 12 (files: /home/user/tab/files/michael-ai/train-v96/knowhow.json). Rollback of data: brain op del_src per src (none shared with v9.5).
+- tools/kb-import-v93.mjs now paces embedding batches (12 s) and retries per-minute 429s. tools/sandbox-v96.mjs: /new before each case, logs provider models too.
+- Tests: t_v96.mjs; t_v95 accepts build v9.5+.

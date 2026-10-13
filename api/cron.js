@@ -6,14 +6,21 @@
 //   &sandbox=1 runs it in the wa-test namespace and sends nothing (used to prove the real scheduler end to end).
 // - A request with x-test-key runs in the sandbox namespace and sends nothing.
 import crypto from 'node:crypto';
-import { morningNudge, runReminders, isTest, sendText, loadState, uploadMedia, sendImage } from './whatsapp.js';
+import { morningNudge, runReminders, isTest, sendText, sendTemplate, loadState, uploadMedia, sendImage } from './whatsapp.js';
 import * as VS from './_verse.js';
 import * as NL from './_newsletter.js';
 import * as V from './_v5.js';
+import * as SPING from './_sowping.js';
 
 export const config = { maxDuration: 300 };
 const OWNER = () => (process.env.WA_ALLOWED || '2348148034092').split(',')[0].replace(/\D/g, '');
 
+function sowKeyOk(request) {        // v9.2: Sow's cron calls us with the SOW_API_KEY the bot already shares with Sow
+  const want = process.env.SOW_API_KEY, got = request.headers.get('x-sow-key') || '';
+  if (!want || want.length < 16) return false;
+  const a = Buffer.from(got), b = Buffer.from(want);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 function bearerOk(request, ...names) {
   const got = request.headers.get('authorization') || '';
   return names.some(n => {
@@ -40,6 +47,19 @@ async function handle(request) {
     } catch (e) { console.log('[cron] verse error', e.message); r = { error: e.message }; }
     return Response.json({ ok: !r.error, task, sandbox, ...r, outbox: sandbox ? ctx.outbox.map(b => b.type === 'text' ? b.text.body : b.type === 'image' ? '[image] ' + (b.image?.caption || '') : '[' + b.type + ']') : undefined });
   }
+  if (task === 'sowping') {        // v9.2: Sow just auto-posted (POST from sow-ng /api/cron, x-sow-key); x-test-key = sandbox, sends nothing
+    if (!test && !sowKeyOk(request)) { await new Promise(r => setTimeout(r, 300)); return new Response('Unauthorized', { status: 401 }); }
+    const sandbox = test || u.searchParams.get('sandbox') === '1';
+    const ctx = sandbox ? { test: true, ns: 'wa-test', outbox: [] } : { test: false, ns: 'wa', outbox: [] };
+    let r;
+    try {
+      const body = request.method === 'POST' ? await request.json().catch(() => ({})) : {};
+      const at = sandbox && u.searchParams.get('now') ? Date.parse(u.searchParams.get('now')) : undefined;
+      r = await SPING.ingest(ctx, body.events || [], { sendText, sendTemplate, loadState, owner: OWNER(), now: at });
+    } catch (e) { console.log('[cron] sowping error', e.message); r = { error: e.message }; }
+    console.log('[cron] sowping', JSON.stringify({ sandbox, ...r }));
+    return Response.json({ ok: !r.error, task, sandbox, ...r, outbox: sandbox ? ctx.outbox.filter(b => b.type === 'text').map(b => b.text.body) : undefined });
+  }
   if (task === 'newsletter') {     // v7.1: Monday & Friday Letters (pg_cron gate row "newsletter"; &sandbox=1 = row "newsletter-test", nothing emailed)
     if (!test && !bearerOk(request, 'SCHED_KEY', 'CRON_SECRET')) { await new Promise(r => setTimeout(r, 300)); return new Response('Unauthorized', { status: 401 }); }
     const sandbox = test || u.searchParams.get('sandbox') === '1';
@@ -48,7 +68,7 @@ async function handle(request) {
     try {
       const testEmails = sandbox ? String(u.searchParams.get('emails') || '').split(',').filter(e => /^[^@\s]+@(?:example\.com|x\.test)$/i.test(e)) : undefined;
       const at = sandbox && u.searchParams.get('now') ? Date.parse(u.searchParams.get('now')) : undefined;
-      r = await NL.runNewsletter(ctx, { sendText, loadState, owner: OWNER(), setNextWake: V.setNextWake, testEmails, now: at, deadlineMs: 230e3 });
+      r = await NL.runNewsletter(ctx, { sendText, sendTemplate, loadState, owner: OWNER(), setNextWake: V.setNextWake, testEmails, now: at, deadlineMs: 230e3 });
     } catch (e) { console.log('[cron] newsletter error', e.message); r = { error: e.message }; }
     return Response.json({ ok: !r.error, task, sandbox, ...r, outbox: sandbox ? ctx.outbox.filter(b => b.type === 'text').map(b => b.text.body) : undefined });
   }

@@ -13,10 +13,12 @@ import * as G from './_gem.js';
 import * as J from './_jobs.js';
 import * as P from './_providers.js';
 import * as V from './_v5.js';
+import * as V95 from './_v95.js';   // v9.5: coding / image-prompt asks
+import * as V96 from './_v96.js';   // v9.6: wider detection
 
 const log = (...a) => console.log('[brain]', ...a);
-export const STRONG = /^(gemini-3\.6-flash|gemini-flash-latest|gemini-3\.8-flash|gemini-3\.5-flash)$/;
-export const isStrong = m => STRONG.test(String(m || '')) || /^(groq|or):strong$/.test(String(m || ''));
+export const STRONG = /^(gemini-3\.6-flash|gemini-flash-latest|gemini-3\.8-flash|gemini-3\.5-flash|gemini-[\d.]+-pro(?:-preview)?|gemini-pro-latest)$/;   // v9.6: pro counts as strong
+export const isStrong = m => STRONG.test(String(m || '')) || /^(groq|or):(strong|heavy)$/.test(String(m || ''));
 export const STRONG_PER_KEY = () => Math.max(0, +(process.env.STRONG_PER_KEY || 20));
 export const EMBED_MODEL = 'gemini-embedding-001';
 export const DIMS = 768;
@@ -33,6 +35,8 @@ export function classify(text, media = false) {
   if (!t || EASY_RE.test(t)) return { level: 'easy', why: 'small talk' };
   if (t.length > 280) return { level: 'hard', why: 'long' };
   if (MATH_RE.test(t)) return { level: 'hard', why: 'maths' };
+  if (V96.codeAsk96(t)) return { level: 'hard', why: 'coding' };          // v9.5 (+ v9.6 wider)
+  if (V96.promptAsk96(t)) return { level: 'hard', why: 'image prompt' };   // v9.5 (+ v9.6 wider)
   const m = t.match(HARD_WORDS);
   if (m) return { level: 'hard', why: m[0].toLowerCase() };
   if (/\bwhy\b/i.test(t) && t.split(/\s+/).length >= 6) return { level: 'hard', why: 'why' };
@@ -82,6 +86,7 @@ export function route(text, media, state, opts = {}) {
   const b = brainOf(state);
   if (c.level === 'easy') { b.route.easy++; return { ...c, chain: 'easy', deep: false }; }
   const left = strongLeft(state, opts);
+  if (c.why === 'coding') { b.route.code = (b.route.code || 0) + 1; return { ...c, chain: 'code', deep: true, left }; }   // v9.6: heaviest model first
   if (left > 0) { b.route.hard++; return { ...c, chain: 'hard', deep: false, left }; }
   if (P.strongChain().length) { b.route.alt = (b.route.alt || 0) + 1; return { ...c, chain: 'alt', deep: true, left: 0 }; }   // other providers' strong models first
   b.route.fallback++;
@@ -90,10 +95,28 @@ export function route(text, media, state, opts = {}) {
 // model order per route; with no other provider keys these equal the v5 chains exactly
 export function chainFor(rt) {
   const ps = P.strongChain(), pf = P.fastChain();
+  if (rt.chain === 'code') return codeChain();
   if (rt.chain === 'hard') return [...V.SMART, ...ps, ...V.LITE, ...pf, ...V.GEMMA];
   if (rt.chain === 'alt') return [...ps, ...V.LITE, ...pf, ...V.GEMMA];
   if (rt.chain === 'deep') return [...V.LITE, ...pf, ...V.GEMMA, ...V.SMART];
   return [...V.LITE, ...pf, ...V.GEMMA, ...V.SMART, ...ps];
+}
+// v9.6 (Michael, 12 Oct: "make it super super smart"): coding asks always start with the heaviest model this key can use.
+// Pro first (free keys get 429 "limit: 0" -> parked until Google's daily reset, so it costs one fast call a day; it answers
+// the day billing is on), then the strong Flash family, then the biggest free model on each other provider, then Lite.
+// The daily strong budget does not apply to code: a parked/quota-hit model is skipped by askGemini's cool map anyway.
+export const PRO = () => String(process.env.CODE_PRO_MODELS ?? 'gemini-3.1-pro-preview').split(',').map(s => s.trim()).filter(Boolean);
+export function codeChain() {
+  // v9.6 adversarial round 2: flash-latest / 3.8 / 3.5 were often 429/503 and their slow refusals ate the 44 s budget before the
+  // heavy free models got a turn, so only the first strong Flash goes ahead of them; the rest follow.
+  return [...new Set([...PRO(), V.SMART[0], ...P.heavyChain(), ...V.SMART.slice(1), ...V.LITE, ...P.fastChain(), ...V.GEMMA])];
+}
+// v9.6: image-prompt / design asks: same route, but OpenRouter's strong model before Groq's (adversarial round 3: Groq's
+// model ignored the brand and thumbnail rules more often).
+export function promptChain(rt) {
+  const c = chainFor(rt); const o = c.indexOf('or:strong'), g = c.indexOf('groq:strong');
+  if (o > g && g >= 0) { c.splice(o, 1); c.splice(g, 0, 'or:strong'); }
+  return c;
 }
 export const DEEP_RULES = '\n\n# THIS IS A HARD QUESTION\nThink it through step by step privately before you answer: work out what he really needs, check each step (and any numbers twice), consider the trade-offs, then give him only the clear final answer with the key reasoning in a few lines. Do not show scratch work unless he asked for it.\n';
 
@@ -162,26 +185,29 @@ export const vecLit = v => '[' + v.map(x => (+x).toFixed(6)).join(',') + ']';
 
 // Is this message worth a lookup in his own material? (not for "hi", commands, or one-word replies)
 const SELF_RE = /\b(my|mine|me|i|i'm|i've|our|olaoluwa|michael|blossom|letters?|books?|novel|chapter|twisted|balm|gilead|golgotha|esther|crack(it)?|algorithm|nysc|bible arena|danfo|ranti|sow|voicepad|accountability|naija vote|studio|newsletter|subscribers?|project|app|site|devotional|write as me|in my voice|like me)\b/i;
+// v9.3: general know-how questions (reference bank) also get a lookup
+const KNOW_RE = /\b(bvn|nin|nimc|transfer|bank|paystack|flutterwave|naira|vercel|render|supabase|github|apk|aab|play store|pwa|twa|whatsapp api|template|reels?|youtube|monetis|monetiz|capcut|premiere|edit(?:ing)?|thumbnail|poster|flyer|prompt|freelanc|pricing|deposit|contract|client|bible|verse|kjv|easter|pentecost|psalms?|gospel|javascript|typescript|node|npm|react|vite|tailwind|css|html|python|git|webhook|telegram|rls|sql|edge function|api|error|bug|debug|deploy|code|coding|image|picture|prompt|flyer|thumbnail|aspect ratio|canva|retain|salesplat|brand colou?rs?)\b/i;
 export function wantsRetrieval(text) {
   const t = String(text || '').trim();
   if (t.length < 12 || EASY_RE.test(t) || /^\s*\//.test(t)) return false;
   if (t.split(/\s+/).length < 3) return false;
-  return SELF_RE.test(t) || t.length > 40;
+  return SELF_RE.test(t) || KNOW_RE.test(t) || t.length > 40;
 }
-export async function retrieve(text, { ns = 'wa', k = 8, voice = false, ms = 6500 } = {}) {
+export async function retrieve(text, { ns = 'wa', k = 8, voice = false, wide = false, ms = 6500 } = {}) {
   const t0 = Date.now();
   if (!brainOn()) return { hits: [], skipped: 'off' };
   const [v] = await embed([text], 'RETRIEVAL_QUERY', { ms: Math.min(4500, ms) });
-  const rows = await brainRpc('match', { ns, emb: vecLit(v), k, chars: 1500 }, Math.max(1500, ms - (Date.now() - t0)));
+  const rows = await brainRpc('match', { ns, emb: vecLit(v), k: voice || wide ? Math.max(k, 14) : k, chars: wide ? 3000 : 1500 }, Math.max(1500, ms - (Date.now() - t0)));
   const min = MIN_SCORE();
   let hits = (rows || []).filter(r => r.score >= min);
   // writing as him: keep at least two of his letters as voice samples, even when a book passage scored higher
-  const top = hits.slice(0, 4);
+  const top = hits.slice(0, wide ? 6 : 4);   // v9.5: wide = coding / image-prompt asks
   if (voice) for (const r of (rows || []).filter(r => /letters/.test(r.src) && r.score >= min - 0.06)) { if (top.filter(x => /letters/.test(x.src)).length >= 2) break; if (!top.includes(r)) top.push(r); }
-  hits = top.slice(0, 5);
+  if (voice) { const vg = (rows || []).find(r => /^voice:/.test(r.src) && r.score >= min - 0.08); if (vg && !top.includes(vg)) top.unshift(vg); }   // v9.5: his voice guide / own essays lead when writing as him
+  hits = top.slice(0, voice || wide ? 6 : 5);
   return { hits, ms: Date.now() - t0, best: rows?.[0]?.score ?? null };
 }
-const SRC_NAME = s => /^book:/.test(s) ? 'his book' : s === 'projects' ? 'his project list' : s === 'learn' ? 'something he taught you (learn)' : 'his Monday & Friday letters';
+const SRC_NAME = s => /^voice:/.test(s) ? 'his own writing / his voice guide' : /^book:/.test(s) ? 'his book' : s === 'projects' ? 'his project list' : s === 'learn' ? 'something he taught you (learn)' : /^knowhow/.test(s) ? 'the reference bank (general know-how, dated: prices and rules change)' : 'his Monday & Friday letters';
 export function brainBlock(hits, { voice = false } = {}) {
   if (!hits || !hits.length) return '';
   const body = hits.map((h, i) => `[${i + 1}] ${h.title || ''} — from ${SRC_NAME(h.src)}${h.url ? ` (${h.url})` : ''}\n${String(h.body || '').replace(/\n{3,}/g, '\n\n').trim()}`).join('\n\n---\n\n');

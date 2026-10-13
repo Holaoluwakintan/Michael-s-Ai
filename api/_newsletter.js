@@ -193,20 +193,33 @@ export async function runNewsletter(ctx, deps) {
   if (!(ctx && ctx.test) && !deps.providers && !mailOn()) out.stop = 'mail_not_configured';
   const iso = t => new Date(t).toISOString();
 
-  // 1. evening preview (from 20:00 Lagos, for tomorrow's letter), only inside WhatsApp's 24h window
+  // 1. evening preview (from 20:00 Lagos, for tomorrow's letter). v9.1: the FULL letter, for review.
+  //    Inside WhatsApp's 24h window it goes straight to him. If the window is shut, an approved template nudges him
+  //    ("letter ready, reply to read it") when one exists, and the full preview waits in kv and goes out the moment he
+  //    next messages the bot (flushPreview), until the 08:00 send.
   const nowL = clock(), h = new Date(nowL).getUTCHours();
   if (h >= PREVIEW_HOUR_UTC) {                                        // 20:00-00:59 Lagos only: never a preview in the small hours
     const tomorrow = addDays(lagosDate(nowL), 1);
     const pv = await rpc('preview_due', { ns, date: tomorrow });
     if (pv && nowL >= previewAtOf(pv.send_on)) {
-      let how = 'window_closed';
+      let how = 'window_closed', open = false;
       try {
         const st = await deps.loadState(deps.owner, ctx);
-        if (st.lastIn && nowL - st.lastIn < 23.5 * 3600e3) {
-          const r = await deps.sendText(deps.owner, previewText(pv), ctx);
+        open = Boolean(st.lastIn && nowL - st.lastIn < 23.5 * 3600e3);
+        if (open) {
+          const r = await sendReview(pv.id, ns, ctx, deps);
           how = r && r.ok !== false ? 'sent' : 'send_failed';
         }
       } catch (e) { how = 'send_failed'; log('preview failed', e.message); }
+      if (how !== 'sent') {
+        const kv = kvOf(deps);
+        try { await kv.put(PENDING_KEY(ns), { id: pv.id, send_at: pv.send_at, subject: pv.subject, at: nowL }); out.pending = true; }
+        catch (e) { log('preview pending write failed', e.message); }
+        let t = null;
+        try { t = await nudgeTemplate(pv, ctx, deps); } catch (e) { t = { ok: false, detail: e.message }; }
+        out.template = t;
+        how = (how === 'send_failed' ? 'send_failed' : 'window_closed') + (t && t.ok ? '_template' : '_waiting');
+      }
       await rpc('preview_mark', { ns, id: pv.id, how });
       out.preview = { id: pv.id, how };
     }
@@ -280,6 +293,80 @@ export async function runNewsletter(ctx, deps) {
 
 export function previewText(l) {
   return `📬 Tomorrow's letter (8am): *${short(l.subject)}*\nReply *skip* to hold it.`;
+}
+
+// ---------- v9.1: the full letter for Michael to review ----------
+export const PENDING_KEY = ns => `${ns}/nl/preview-pending`;
+// templates tried (in order) when his 24h window is shut; only an APPROVED one is used
+export const PREVIEW_TEMPLATES = () => [...new Set([process.env.NL_PREVIEW_TEMPLATE || 'michael_letter_ready_v1', process.env.OUTREACH_TEMPLATE || 'michael_checkin_v1'])];
+export function kvOf(deps = {}) {
+  return {
+    get: deps.kvGet || (k => J.rpc('kv_get', { k })),
+    put: deps.kvPut || ((k, v) => J.rpc('kv_put', { k, v })),
+  };
+}
+export function reviewText(full, subs) {
+  const f = full.fields || {};
+  const m = render(f, { kind: full.kind });
+  const letter = m.text.split('\n—\n')[0].replace('%%FIRST_NAME%%', '<first name>').trim();
+  const when = full.send_on ? `${niceDate(full.send_on)} at 8am` : 'at 8am';
+  return `📬 *Your next letter, for review*\nIt goes out ${when}${subs ? ` to *${subs}* subscribers` : ''}.\n\n*Subject:* ${full.subject || subjectOf(f)}\n\n${letter}\n\n———\nReply *skip* to hold it (it moves to the spare pile, nothing goes that day). Do nothing and it goes out as written.`;
+}
+async function sendReview(id, ns, ctx, deps) {
+  const full = await rpc('get', { ns, id });
+  if (!full) return { ok: false, detail: 'letter not found' };
+  let subs = null;
+  try { subs = await rpc('subs_count', {}); } catch { subs = null; }
+  return deps.sendText(deps.owner, reviewText(full, subs), ctx);
+}
+const oneLine = s => String(s || '').replace(/\s*\n+\s*/g, ' ').replace(/ {4,}/g, ' ').trim();
+export function templateParams(name, l) {
+  const day = /^(Monday|Friday) Letter/.exec(l.subject || '')?.[1];
+  const what = day ? `${day} Letter` : 'newsletter';
+  if (name === (process.env.OUTREACH_TEMPLATE || 'michael_checkin_v1') && name !== (process.env.NL_PREVIEW_TEMPLATE || 'michael_letter_ready_v1'))
+    return ['Michael', oneLine(`Your ${what} "${short(l.subject)}" goes to your subscribers at 8am tomorrow. Reply here to read it first, or reply skip to hold it.`)];
+  return [what, oneLine(short(l.subject))];
+}
+export async function templateStatusOf(name) {
+  const waba = process.env.WA_WABA_ID, tok = process.env.WA_TOKEN;
+  if (!waba || !tok) return 'UNKNOWN';
+  const r = await fetch(`https://graph.facebook.com/${process.env.WA_GRAPH_VERSION || 'v26.0'}/${waba}/message_templates?name=${encodeURIComponent(name)}&fields=name,status,language`, { headers: { authorization: `Bearer ${tok}` }, signal: AbortSignal.timeout(8000) });
+  const j = await r.json().catch(() => ({}));
+  const t = (j.data || []).find(x => x.name === name);
+  return t ? { status: t.status, lang: t.language } : 'NOT_FOUND';
+}
+// window shut: nudge him with the first APPROVED template (none approved yet -> nothing sent, the preview just waits)
+async function nudgeTemplate(l, ctx, deps) {
+  if (!deps.sendTemplate) return { ok: false, detail: 'no template sender' };
+  const tried = [];
+  for (const name of PREVIEW_TEMPLATES()) {
+    let st;
+    try { st = await (deps.templateStatus || templateStatusOf)(name); } catch (e) { st = 'UNKNOWN'; }
+    const status = typeof st === 'string' ? st : st.status;
+    tried.push(`${name}:${status}`);
+    if (status !== 'APPROVED') continue;
+    const r = await deps.sendTemplate(deps.owner, name, (st && st.lang) || 'en', templateParams(name, l), ctx);
+    if (r && r.ok !== false) return { ok: true, name, id: r.id || null };
+    tried.push(`${name}:send_failed ${String(r && r.detail || '').slice(0, 80)}`);
+  }
+  return { ok: false, tried };
+}
+// Called when Michael messages the bot: a preview that waited for his window goes out now (once), until the 08:00 send.
+export async function flushPreview(ctx, deps) {
+  const ns = ctx && ctx.test ? 'wa-test' : 'wa';
+  const kv = kvOf(deps);
+  const p = await kv.get(PENDING_KEY(ns));
+  if (!p || !p.id) return null;
+  await kv.put(PENDING_KEY(ns), { id: null, cleared: Date.now() });     // clear first: two quick messages never send it twice
+  const now = deps.now ?? Date.now();
+  const full = await rpc('get', { ns, id: p.id });
+  if (!full || full.status !== 'scheduled' || Date.parse(full.send_at) <= now) return { dropped: true, id: p.id, status: full && full.status };
+  let subs = null;
+  try { subs = await rpc('subs_count', {}); } catch { subs = null; }
+  const r = await deps.sendText(deps.owner, reviewText(full, subs), ctx);
+  if (r && r.ok !== false) { try { await rpc('preview_mark', { ns, id: p.id, how: 'sent_on_reply' }); } catch { /* best effort */ } return { sent: true, id: p.id }; }
+  await kv.put(PENDING_KEY(ns), p);                                    // didn't go: try again on his next message
+  return { sent: false, id: p.id, detail: r && r.detail };
 }
 
 // ---------- WhatsApp commands (owner only) ----------

@@ -6,7 +6,8 @@
 import { waitUntil } from '@vercel/functions';
 import * as J from './_jobs.js';
 import { runTick } from './_agent.js';
-import { sendText, uploadMedia, sendImage, sendDocument, sendMedia, downloadFile, loadKB, saveKB, addFact } from './whatsapp.js';
+import { sendText, uploadMedia, sendImage, sendDocument, sendMedia, downloadFile, loadKB, saveKB, addFact, v9Deps } from './whatsapp.js';
+import * as V9 from './_v9.js';
 import { generateImage, fetchPage } from './_extras.js';
 import { webResults, readTop } from './_v5.js';
 import PROFILE from './_profile.js';
@@ -45,6 +46,11 @@ export async function work(ns, id = null, { chain = true, deps = DEPS, kinds = n
   return r;
 }
 
+export async function v9tick(ctx, force = null) {
+  try { const D = v9Deps(ctx); return await V9.tick(ctx.ns, D.owner, D, { force }); }
+  catch (e) { log('v9 tick failed', e.message); return { error: e.message }; }
+}
+
 export async function POST(request) {
   const url = new URL(request.url);
   const a = auth(request, url);
@@ -52,6 +58,11 @@ export async function POST(request) {
   if (!J.jobsOn()) return Response.json({ ok: false, error: 'jobs store not configured' }, { status: 503 });
   const ns = a.sandbox ? 'wa-test' : 'wa';
   const id = url.searchParams.get('id') ? +url.searchParams.get('id') : null;
+  if (a.test && url.searchParams.get('v9') === '1') {            // v9 sandbox: run the outreach/growth/digest tick now and show what it would send
+    const ctx = { test: true, ns, outbox: [] };
+    const r = await v9tick(ctx, url.searchParams.get('force') || null);
+    return Response.json({ ok: true, ...r, outbox: ctx.outbox.map(b => b.text?.body || b.template || b) });
+  }
   if (a.test && url.searchParams.get('sync') === '1') return Response.json({ ok: true, ...(await work(ns, id, { chain: false })) });
   waitUntil(work(ns, id));
   return Response.json({ ok: true, accepted: true, ns }, { status: 202 });
@@ -59,7 +70,7 @@ export async function POST(request) {
 
 export async function GET(request) {
   const url = new URL(request.url);
-  if (url.searchParams.get('health') === '1') return Response.json({ ok: true, jobs: J.jobsOn(), build: 'v8.0' });
+  if (url.searchParams.get('health') === '1') return Response.json({ ok: true, jobs: J.jobsOn(), build: 'v9.1' });
   const a = auth(request, url);
   if (!a.ok || !a.test) return new Response('unauthorized', { status: 401 });
   const id = +url.searchParams.get('id');

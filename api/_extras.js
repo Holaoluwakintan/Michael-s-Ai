@@ -2,6 +2,7 @@
 // No heavy deps: fetch + regex text extraction. Env (all optional): POLLINATIONS_KEY (+ POLLINATIONS_MODEL, default flux),
 // CF_ACCOUNT_ID + CF_AI_TOKEN (Cloudflare Workers AI flux-1-schnell), IMG_DAILY_LIMIT (default 20), GEMINI_API_KEY (Gemini image, tried only
 // when not parked; Google's free tier gives image models "limit: 0", so a 429 parks it until midnight Pacific).
+import { brandStyle95 } from './_v95.js';   // v9.5
 
 export const PAGE_CAP = 30000;            // chars of page text kept for the model
 const FETCH_TIMEOUT = 10000;              // ms per page fetch
@@ -226,9 +227,24 @@ export const SAVE_ONLY_RE = /^\s*(save|save it|save this|save that|save them|yes
 // ---------- image generation ----------
 export const IMAGE_RE = /^\s*(?:\/(?:image|img|draw|imagine)\b\s*[:：]?|(?:image|img|draw|picture|imagine)\s*[:：])\s*([\s\S]*)$/i;
 const NATURAL_IMG_RE = /^\s*(?:hey\s+)?(?:please\s+)?(?:can you\s+|could you\s+|pls\s+|abeg\s+)?(?:please\s+)?(?:generate|make|create|draw|design|paint)\s+(?:me\s+|for me\s+)?(?:an?\s+|one\s+|the\s+)?(?:(?:portrait|square|status|landscape)\s+)?(?:ai\s+)?(?:image|picture|pic|photo|illustration|drawing|wallpaper|poster|artwork|flyer background)\s+(?:of|showing|with|for|where|that shows|about)\s+([\s\S]{3,})$/i;
+// v9.3: posters, flyers, thumbnails, verse graphics… ("make a bible verse graphic for Psalm 23", "design my church flyer with …")
+const DESIGN_NOUN = '(?:image|picture|pic|photo|illustration|drawing|wallpaper|poster|artwork|flyer|thumbnail|banner|graphic|cover|cover photo|invitation|invite card|card|background|post image|status image)';
+const NATURAL2_RE = new RegExp(String.raw`^\s*(?:hey\s+)?(?:please\s+)?(?:can you\s+|could you\s+|pls\s+|abeg\s+)?(?:please\s+)?(?:generate|make|create|draw|design|paint)\s+(?:me\s+|for me\s+)?(?:an?\s+|one\s+|the\s+|my\s+)?((?:[\w'’-]+\s+){0,3}?${DESIGN_NOUN})\s+(of|showing|with|for|where|that shows|about|on)\s+([\s\S]{3,})$`, 'i');
+const PLAIN_NOUN = /^(?:(?:portrait|square|status|landscape|ai)\s+)*(?:image|picture|pic|photo|illustration|drawing|artwork)$/i;
+export const DESIGN_KIND_RE = /\b(poster|flyer|thumbnail|banner|graphic|cover|invitation|invite|card)\b/i;
+export function brandStyle(prompt) {
+  const p = String(prompt || ''); let s = brandStyle95(p);   // v9.5: RETAIN palette, Nigerian look
+  if (/\bblossom\b/i.test(p)) s += ', Blossom brand look: near-black and graphite with a dusty-rose accent, elegant and modern';
+  if (/\b(bible|verse|psalm|faith|church|jesus|christ|god|prayer|pray|worship|gospel|sermon|cross)\b/i.test(p)) s += ', reverent and hopeful, warm golden light, dignified';
+  if (/\bthumbnail\b/i.test(p)) s += ', bold high-contrast subject, expressive face, uncluttered background, clear empty area for a title';
+  else if (DESIGN_KIND_RE.test(p)) s += ', clean layout with generous empty space at the top for a headline';
+  return s;
+}
 export function detectImage(text) {
   const t = String(text || '').trim();
-  const m = t.match(IMAGE_RE) || t.match(NATURAL_IMG_RE);
+  let m = t.match(IMAGE_RE);
+  if (!m) { const n2 = t.match(NATURAL2_RE); if (n2) m = [n2[0], PLAIN_NOUN.test(n2[1].trim()) ? n2[3] : `${n2[1].trim()} ${n2[2]} ${n2[3]}`]; }   // v9.3
+  if (!m) m = t.match(NATURAL_IMG_RE);
   if (!m) return null;
   let prompt = m[1].trim();
   let w = 1080, h = 1350, shape = 'portrait 4:5';
@@ -269,7 +285,7 @@ export function providerList(env = process.env) {
 export function primaryProvider(env = process.env) { return providerList(env).find(p => p === 'pollinations' || p === 'cloudflare') || 'pending_key'; }
 
 async function tryProvider(p, prompt, w, h, seed, ms) {
-  const full = prompt + STYLE;
+  const full = prompt + brandStyle(prompt) + STYLE;   // v9.3: brand/faith/thumbnail/poster looks
   if (p === 'pollinations' || p === 'pollinations-free') {
     const base = p === 'pollinations' ? 'https://gen.pollinations.ai/image/' : 'https://image.pollinations.ai/prompt/';
     const model = p === 'pollinations' ? (process.env.POLLINATIONS_MODEL || 'flux') : 'flux';
@@ -328,3 +344,4 @@ export async function generateImage(prompt, { width = 1080, height = 1350, cool 
   }
   return { ok: false, tried, ms: Date.now() - started, busy: tried.some(t => t.status === 402 || t.status === 429 || t.status === 500 || t.status === 'timeout') };
 }
+

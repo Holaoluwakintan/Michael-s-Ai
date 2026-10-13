@@ -235,7 +235,7 @@ ok('help shows Agent mode with the commands', x.sent.at(-1).includes('Agent mode
 x = await say('usage');
 ok('usage counts agent jobs', /Agent jobs started: [1-9]/.test(x.sent.at(-1)));
 { const r = await m.GET(new Request('http://x/api/whatsapp?health=1')); const h = await r.json();
-  ok('health: build v6.0, agent true, jobs true', /^v(6|7|8)\.\d/.test(h.build) && h.agent === true && h.jobs === true && h.builds_daily_limit === 10); }
+  ok('health: build v6.0, agent true, jobs true', /^v(6|7|8|9)\.\d/.test(h.build) && h.agent === true && h.jobs === true && h.builds_daily_limit === 10); }
 // jobs endpoint auth
 { const jobs = await import('./api/jobs.js');
   const r1 = await jobs.POST(new Request('http://x/api/jobs', { method: 'POST' }));
