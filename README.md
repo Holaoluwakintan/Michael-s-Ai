@@ -1,5 +1,12 @@
 # Michael AI
 
+## Build, run, deploy (added Oct 14 2026)
+- No build step. Static PWA in `public/`, serverless functions in `api/` (Vercel, Node 20). `npm install` only for local tests.
+- Deploy: Vercel project `michael-ai` (hostname michael-ai-mu.vercel.app). Any Vercel deploy of this folder works (`vercel --prod`), or the REST deploy script Tab used.
+- Tests (mocked): `node t_v9.mjs`, `node t_v96.mjs`, ... (see tools/run_all.sh). Some suites use the real store under the `wa-test/` namespace.
+- Env vars (set in Vercel, never in code): GEMINI_API_KEY, GEMINI_API_KEY_2, APP_PASSCODE, WA_TOKEN, WA_PHONE_ID, WA_WABA_ID, WA_VERIFY_TOKEN, WA_APP_SECRET, WA_ALLOWED, WA_TEST_KEY, CRON_SECRET, SB_URL + Supabase key (jobs/kv store), SCHED_KEY, BLOB_READ_WRITE_TOKEN, VERCEL_TOKEN/VERCEL_TEAM_ID (site builder), GITHUB token (repo edits), SOW_API_KEY, BREVO_API_KEY, BROADCAST_SECRET, BROADCAST_URL, GROQ_API_KEY, OPENROUTER_API_KEY, PUBLIC_URL. Copies of the values live in Michael's Vercel project settings.
+- Supabase schema: `sql/` (michael_ai schema: kv, jobs, sched, kchunks pgvector, newsletter).
+
 Private AI assistant for Olaoluwa Michael. Static PWA in `public/` + `api/chat.js` (Gemini). `api/whatsapp.js` is the WhatsApp Cloud API webhook (v2, 6 Oct 2026; v3 same day: 60k knowledge limit + multi-teach; v4 same day: link reading + image generation, code in `api/_extras.js`): Michael's PERSONAL assistant, owner-only.
 
 Storage (private Vercel Blob store `michael-ai-wa`): `wa/<number>.json` = chat history (last 20 turns), dedupe ids, model cool-downs, pending Facebook draft; `wa/<number>.knowledge.json` = taught facts + settings (nudge on/off). `wa/others/<number>.json` = when the private line was last sent to a stranger. Test runs use `wa-test/`.
