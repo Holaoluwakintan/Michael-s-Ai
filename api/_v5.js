@@ -8,11 +8,13 @@ import { fetchPage, blockedSite, decodeEntities } from './_extras.js';
 // ---------- models: rotation tiers (observed on Michael's free key, 6 Oct 2026) ----------
 // SMART: best answers, small free daily quota each (~20/day on full Flash). LITE: fast, bigger quota. GEMMA: open models
 // served by the same API with a large free daily quota; they "think" unless told thinkingLevel minimal.
-export const SMART = ['gemini-3.6-flash', 'gemini-flash-latest', 'gemini-3.8-flash', 'gemini-3.5-flash'];
+// v9.7 (19 Oct 2026 probe + Oct 12-19 usage): 3.6-flash and 3.5-flash answer most often; flash-latest / 3.8 were 503 "busy" most of the
+// week; Gemma was 429 all week, so it goes last. On top of this order, askGemini ranks by each model's ok/fail count today (_v97 rankChain).
+export const SMART = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-flash-latest', 'gemini-3.8-flash'];
 export const LITE = ['gemini-flash-lite-latest', 'gemini-3.1-flash-lite'];
 export const GEMMA = ['gemma-4-26b-a4b-it', 'gemma-4-31b-it'];
 export const HARD_CHAIN = [...SMART, ...LITE, ...GEMMA];   // long/hard asks, writing, media
-export const EASY_CHAIN = [...LITE, ...GEMMA, ...SMART];   // short everyday questions: save Flash for the hard ones
+export const EASY_CHAIN = [...LITE, ...SMART, ...GEMMA];   // short everyday questions: Lite first, then Flash before the (429) Gemma
 export const isGemma = m => /^gemma/i.test(m);
 const HARD_RE = /\b(write|draft|rewrite|compose|script|caption|essay|article|newsletter|devotional|sermon|poem|story|plan|strategy|explain|analy[sz]e|compare|review|summari[sz]e|outline|step[- ]by[- ]step|code|debug|function|translate|proposal|pitch|letter|email|bio|marketing|business plan|ideas?)\b/i;
 export function isHard(text, media = false) {

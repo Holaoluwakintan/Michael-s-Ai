@@ -88,7 +88,7 @@ export async function chat(vid, sys, contents, { maxTokens = 2048, temperature =
     if (r.ok) {
       let j = {}; try { j = JSON.parse(txt); } catch {}
       const text = String(j.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-      return text ? { ok: true, status: 200, text, model } : { ok: false, status: 'empty', model, errText: txt.slice(0, 200) };
+      return text ? { ok: true, status: 200, text, model, finish: j.choices?.[0]?.finish_reason === 'length' ? 'MAX_TOKENS' : '' } : { ok: false, status: 'empty', model, errText: txt.slice(0, 200) };
     }
     if ((r.status === 404 || (r.status === 400 && /model|decommission|not found|does not exist/i.test(txt))) && attempt === 0 && !process.env[P.pin[vid.split(':')[1]]]) {
       listCache.delete(p); model = await resolve(vid, { fetchImpl, avoid: [model] }); continue;     // retired model: pick another once

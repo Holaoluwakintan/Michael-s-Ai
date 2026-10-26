@@ -33,7 +33,9 @@ import * as GR from './_repo.js';
 import * as SOW from './_sow.js';
 import { parseMediaCmd } from './_mediacmd.js';
 import * as SPING from './_sowping.js';             // v9.2: "Sow just posted" pings (sow pings on/off)
+import * as RPC from './_rpc.js';                  // v9.8.0: Royal People Care daily post drop (08:00 Lagos) + royals cmds
 import * as SP from './_sowplus.js';               // v8: sow · sow week · posted <platform> · sow <day> · add a post for <when> about <topic>
+import * as V97 from './_v97.js';               // v9.7: reminder questions + pending expiry, weak-answer retry + model health ranking, long-term memory, live morning brief
 import * as R8 from './_remind8.js';                // v8: several times in one reminder, clarification answers, no fake "I've set it"
 import * as PV from './_providers.js';             // v8: Groq / OpenRouter free models beside Gemini (only when their keys are set)
 import * as BR from './_brain.js';                // v8: routing, his-world retrieval, auto-memory, fresh-info search
@@ -130,7 +132,7 @@ export async function loadState(num, ctx = liveCtx()) {
   return { history: s.history || [], memory: s.memory || [], seen: s.seen || [], cool: s.cool || {}, migrated: !!s.migrated, pending: s.pending || null, lastIn: s.lastIn || 0, lastRead: s.lastRead || null, img: s.img || null, lastImage: s.lastImage || null,
     usage: s.usage || null, jobsUntil: s.jobsUntil || 0, sc: s.sc || [], lastQA: s.lastQA || null, keeperFor: s.keeperFor || null, schedNext: s.schedNext ?? null,
     lastMedia: s.lastMedia || null, sowLast: s.sowLast || [], nlPending: s.nlPending || null,
-    brain: s.brain || null, lastBrain: s.lastBrain || null, remPending: s.remPending || null, remPendingReasked: s.remPendingReasked || false, lastPolish: s.lastPolish || null };   // v8: per-key strong/lite counts for routing + last retrieval
+    brain: s.brain || null, lastBrain: s.lastBrain || null, remPending: s.remPending || null, remPendingReasked: s.remPendingReasked || false, lastPolish: s.lastPolish || null, mh: s.mh || null };   // v8: per-key strong/lite counts for routing + last retrieval
 }
 export async function saveState(num, s, ctx = liveCtx()) {
   s.history = (s.history || []).slice(-MAX_TURNS * 2);
@@ -237,6 +239,13 @@ export async function sendMedia(to, mediaId, type, caption, ctx = liveCtx()) {
   const obj = type === 'audio' ? { id: mediaId } : { id: mediaId, caption: String(caption || '').slice(0, 1024) };
   return graph(phonePath(), { messaging_product: 'whatsapp', recipient_type: 'individual', to, type, [type]: obj }, ctx);
 }
+// v9.8: an image / video by Meta media id ({ id }) or public URL ({ link }), no caption (RPC drop: the caption follows as its own text)
+export async function sendMediaRef(to, type, ref, ctx = liveCtx()) {
+  return graph(phonePath(), { messaging_product: 'whatsapp', recipient_type: 'individual', to, type, [type]: ref.id ? { id: ref.id } : { link: ref.link } }, ctx);
+}
+export function rpcDeps(ctx, extra = {}) {
+  return { loadState, sendText, sendTemplate, uploadMedia, sendMediaRef, owner: ALLOWED()[0], ...extra };
+}
 // v6: a file as a WhatsApp document (the zip of a site's source)
 export async function sendDocument(to, mediaId, filename, caption, ctx = liveCtx()) {
   return graph(phonePath(), { messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'document', document: { id: mediaId, filename, caption: String(caption || '').slice(0, 1024) } }, ctx);
@@ -319,13 +328,15 @@ export function systemText(facts, opts = {}) {
   const lean = opts.lean && !voice;
   let kbFacts = facts, omitted = 0;
   // v9.3: with a question, send the most relevant taught facts (topic + keywords + pinned + newest), not all/oldest-first
-  if (opts.query) ({ facts: kbFacts, omitted } = V93.pickFacts(facts, opts.query, lean ? V93.LEAN_BUDGET : V93.FULL_BUDGET, { voice }));
+  const learned = (facts || []).filter(f => f && f.ltm);       // v9.7: learned-from-chat facts get their own block (not competing with taught ones)
+  if (learned.length) kbFacts = (facts || []).filter(f => !(f && f.ltm));
+  if (opts.query) ({ facts: kbFacts, omitted } = V93.pickFacts(kbFacts, opts.query, lean ? V93.LEAN_BUDGET : V93.FULL_BUDGET, { voice }));
   const now = new Date();
   const day = now.toLocaleDateString('en-GB', { timeZone: 'Africa/Lagos', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
   const time = now.toLocaleTimeString('en-GB', { timeZone: 'Africa/Lagos', hour: '2-digit', minute: '2-digit' });
   return (lean ? LEAN_SYSTEM : SYSTEM) + WA_RULES + PA_RULES + V9.ethicBlock() + V93.SKILLS_RULES + V95.SKILLS_V95 + V96.SKILLS_V96 + `\n\n# NOW\nToday is ${day}, ${time} in Nigeria (Africa/Lagos).\n`
     + '\n\n# BASE PROFILE (seeded facts about Michael; a taught fact wins if they conflict)\n' + PROFILE + knowledgeBlock(kbFacts)
-    + (omitted ? `- (${omitted} other taught facts not shown here because they don't look related to this message)\n` : '');
+    + (omitted ? `- (${omitted} other taught facts not shown here because they don't look related to this message)\n` : '') + V97.ltmBlock(learned);
 }
 function historyContents(history) {
   const out = [];
@@ -368,6 +379,9 @@ export async function askGemini(history, facts, userParts, started, opts = {}) {
   const now = Date.now();
   let order = chain.filter(m => !(cool[m] > now));
   if (!order.length) order = [...V.GEMMA, ...chain.slice(-2)];  // everything parked: still try the big-quota models
+  if (track && !opts.media) order = V97.rankChain(order, track.mh);   // v9.7: models that keep failing today go to the back
+  let weak = null;                                             // v9.7: a weak answer is kept only as a last resort
+  const weakOf = (text, finish) => opts.quality == null ? null : V97.weakReply(text, { question: opts.quality, finish });
   let first = true, fastFail = false;
   for (const model of order) {
     const spent = Date.now() - started;
@@ -381,10 +395,14 @@ export async function askGemini(history, facts, userParts, started, opts = {}) {
       const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), budget);
       let pr;
       try { pr = await PV.chat(model, sysFor(model), contents, { maxTokens: opts.maxTokens || 2048, temperature: opts.temperature ?? 0.7, signal: ctl.signal, ...(/:heavy$/.test(model) ? { sysMax: 40000 } : {}) }); }
-      catch (e) { clearTimeout(timer); cool[model] = Date.now() + 3 * 60e3; tried.push(model + ':timeout'); first = false; continue; }
+      catch (e) { clearTimeout(timer); cool[model] = Date.now() + 3 * 60e3; tried.push(model + ':timeout'); if (track) V97.noteHealth(track, model, false); first = false; continue; }
       clearTimeout(timer);
-      if (pr.ok) { if (track) { V.bumpModel(track, model); BR.noteCall(track, model, null); } tried.push(model + ':ok'); return { ok: true, text: pr.text, model, provider_model: pr.model, cool, tried }; }
-      if (track) BR.noteCall(track, model, null, false);
+      if (pr.ok) {
+        const why = weakOf(pr.text, pr.finish || '');
+        if (why && Date.now() - started < 40000) { if (track) V97.noteHealth(track, model, false); tried.push(model + ':weak-' + why); if (!weak) weak = { ok: true, text: pr.text, model, provider_model: pr.model, weak: why }; first = false; continue; }
+        if (track) { V.bumpModel(track, model); BR.noteCall(track, model, null); V97.noteHealth(track, model, true); } tried.push(model + ':ok'); return { ok: true, text: pr.text, model, provider_model: pr.model, cool, tried };
+      }
+      if (track) { BR.noteCall(track, model, null, false); if (pr.status === 429 || pr.status === 'empty' || pr.status >= 500) V97.noteHealth(track, model, false); }
       if (pr.status === 429) { quota = true; cool[model] = coolUntil(pr.errText); }
       else if (pr.status !== 415) cool[model] = Date.now() + (pr.status === 401 || pr.status === 403 ? 6 * 3600e3 : 5 * 60e3);
       lastStatus = pr.status; tried.push(model + ':' + pr.status); fastFail = Date.now() - t0m < 2500; first = false; continue;
@@ -400,20 +418,27 @@ export async function askGemini(history, facts, userParts, started, opts = {}) {
       let r;
       try {
         r = await G.gemFetch(model, body, { signal: ctl.signal, src: opts.src || 'chat', retry: first ? 1 : 0, retryWaitMs: 900, deadline: started + 44000 });   // v7: key 2 on 429, one retry on 503
-      } catch (e) { lastStatus = 504; clearTimeout(timer); cool[model] = Date.now() + 3 * 60e3; tried.push(model + ':timeout'); break; }
+      } catch (e) { lastStatus = 504; clearTimeout(timer); cool[model] = Date.now() + 3 * 60e3; tried.push(model + ':timeout'); if (track) V97.noteHealth(track, model, false); break; }
       clearTimeout(timer);
       if (track) BR.note429s(track, model, r.headers.get('x-gem-429'));   // v8: per-key limit hits (brain + strong budget)
       if (r.ok) {
         const j = await r.json();
         const cand = j.candidates?.[0] || {};
         const text = (cand.content?.parts || []).filter(p => !p.thought && p.text).map(p => p.text).join('').trim();
-        if (text) { if (track) { V.bumpModel(track, model); BR.noteCall(track, model, r.headers.get('x-gem-key')); } tried.push(model + ':ok'); return { ok: true, text, model, key: +(r.headers.get('x-gem-key') || 1), cool, tried }; }
+        const why = text ? weakOf(text, cand.finishReason || '') : null;
+        if (text && why && Date.now() - started < 40000) {         // v9.7: weak / busy / cut-off answer -> next model (kept as a last resort)
+          if (track) V97.noteHealth(track, model, false);
+          tried.push(model + ':weak-' + why); if (!weak) weak = { ok: true, text, model, key: +(r.headers.get('x-gem-key') || 1), weak: why }; break;
+        }
+        if (text) { if (track) { V.bumpModel(track, model); BR.noteCall(track, model, r.headers.get('x-gem-key')); V97.noteHealth(track, model, true); } tried.push(model + ':ok'); return { ok: true, text, model, key: +(r.headers.get('x-gem-key') || 1), cool, tried }; }
+        if (track) V97.noteHealth(track, model, false);
         lastStatus = 'empty:' + (cand.finishReason || j.promptFeedback?.blockReason || '?');
         tried.push(model + ':' + lastStatus);
         break;
       }
       lastStatus = r.status;
       const errText = await r.text().catch(() => '');
+      if (track && (r.status === 429 || r.status >= 500)) V97.noteHealth(track, model, false);
       if (r.status === 429) {
         quota = true; cool[model] = coolUntil(errText); if (track) V.noteLimit(track, model);
         log('429 on', model, 'parked until', new Date(cool[model]).toISOString()); tried.push(model + ':429'); break;
@@ -429,6 +454,7 @@ export async function askGemini(history, facts, userParts, started, opts = {}) {
     fastFail = Date.now() - t0m < 2500;
     first = false;
   }
+  if (weak) { if (track) V.bumpModel(track, weak.model); return { ...weak, cool, tried }; }   // v9.7: every other model failed: the weak answer beats an error line
   return { ok: false, status: lastStatus, quota, cool, tried };
 }
 
@@ -604,6 +630,7 @@ export async function deliverDue(owner, state, kb, ctx, now = Date.now(), { wind
 async function syncSched(state, kb, ctx, { force = false } = {}) {
   let t = V.nextWake(kb, state.lastIn, state.keeperFor) || null;
   if (kvOn() && process.env.V9_GATE !== '0') { try { const t9 = await V9.nextDue(ctx.ns); if (t9 && (!t || t9 < t)) t = t9; } catch (e) { log('v9 next due failed', e.message); } }   // v9: outreach / digest / Monday nudge share the gate
+  if ((kvOn() || ctx.test) && RPC.rpcOn()) { try { const tr = await RPC.nextDue(ctx.ns, state.lastIn, Date.now(), { reminderKeeperFor: state.keeperFor }); if (tr && (!t || tr < t)) t = tr; } catch (e) { log('rpc next due failed', e.message); } }   // v9.8: RPC drop 07:00 UTC + held day + heads-up share the gate
   if (!force && t === (state.schedNext ?? null)) return;
   const r = await V.setNextWake(ctx.test ? 'test' : 'live', t);
   if (r.ok) state.schedNext = t; else if (!r.off) log('scheduler sync failed', r.status || r.detail);
@@ -616,6 +643,7 @@ export async function runReminders(ctx = liveCtx(), { now = Date.now() } = {}) {
   const [state, kb] = await Promise.all([loadState(owner, ctx), loadKB(owner, ctx)]);
   const r = await deliverDue(owner, state, kb, ctx, now);
   if (kvOn() || ctx.test) { try { r.v9 = await V9.tick(ctx.ns, owner, v9Deps(ctx, kb.facts || []), { now }); } catch (e) { log('v9 tick failed', e.message); r.v9 = { error: e.message }; } }   // v9: daily outreach drafts, Monday growth, 8pm digest
+  if ((kvOn() || ctx.test) && RPC.rpcOn()) { try { r.rpc = await RPC.run(ctx, rpcDeps(ctx, { now, reminderKeeperFor: state.keeperFor })); } catch (e) { log('rpc run failed', e.message); r.rpc = { error: e.message }; } }   // v9.8: Royal People Care daily drop (08:00 Lagos)
   const before = state.schedNext ?? null;
   await syncSched(state, kb, ctx, { force: true });
   if (r.changed || (state.schedNext ?? null) !== before) await Promise.all([saveState(owner, state, ctx), r.changed ? saveKB(owner, kb, ctx) : null]);
@@ -742,6 +770,9 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   }
   await markReadTyping(msg.id, ctx);
   const now = () => Date.now();
+  if (state.remPending && V97.dropPending(state.remPending, msg.type === 'text' ? String(msg.text?.body || '') : null)) {   // v9.7: 5 min, and a reply with no time cancels it
+    log('reminder question dropped (expired or answered with something else)'); state.remPending = null; state.remPendingReasked = false;
+  }
   // v5: tell him what he missed while WhatsApp's 24h window was shut, then deliver anything due (he just wrote, so it's open)
   const notice = V.missedNotice(kb);
   if (notice) { kbDirty = true; await sendText(from, notice, ctx); }
@@ -758,6 +789,10 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     const tb = msg.type === 'text' ? String(msg.text?.body || '') : '';
     const pc = SPING.detect(tb);
     if (!(pc && pc.op === 'off')) { try { const fh = await SPING.flushHeld(ctx, { sendText, owner: from }); if (fh) { log('sow ping flush', JSON.stringify(fh)); if (ctx.test) ctx.spFlush = fh; } } catch (e) { log('sow ping flush failed', e.message); } }
+  }
+  // v9.8: a Royals day that waited for his window: wake the gate now (it sends from /api/cron, 300 s, not this 60 s webhook)
+  if (from === ALLOWED()[0] && (J.jobsOn() || ctx.test) && RPC.rpcOn()) {
+    try { const rs = await RPC.load(ctx.ns); if (RPC.wantsFlush(rs, Date.now(), Date.now())) { const w = await V.setNextWake(ctx.test ? 'test' : 'live', Date.now() + 5e3); if (w.ok) state.schedNext = null; if (ctx.test) ctx.rpcWake = { held: rs.held, ok: !!w.ok }; } } catch (e) { log('rpc flush wake failed', e.message); }
   }
   if (dd.changed) kbDirty = true;
 
@@ -1016,7 +1051,13 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     const q = imageQuota(state);
     if (!q.left) return finish(`🎨 That's today's ${q.limit} free pictures used up. The count resets at midnight US Pacific time (8–9am Nigeria time). I can still chat, read links and help you write.`, ut, null);
     await sendText(from, `🎨 Drawing it (${req.shape})… give me 10–30 seconds.`, ctx);
-    const img = await generateImage(req.prompt, { width: req.width, height: req.height, cool: state.cool, budgetMs: Math.max(15000, 50000 - (Date.now() - started)) });
+    let drawPrompt = req.prompt;                              // v9.7: a vague ask becomes a concrete scene first (8 s max; else his words as they are)
+    if (process.env.IMG_SCENE !== '0') {
+      const sc = await Promise.race([askGemini([], [], [{ text: V97.scenePrompt(req.prompt, req.shape) }], Date.now(), { cool: { ...(state.cool || {}) }, chain: LITE_FIRST, maxTokens: 400, temperature: 0.7, system: 'You write prompts for an image model. Output only the prompt.', src: 'img-scene' }).catch(() => null), new Promise(r => setTimeout(() => r(null), 8000))]);
+      const t = sc && sc.ok ? V97.cleanScene(sc.text, req.prompt) : null;
+      if (t) { drawPrompt = t; log('image scene', t.slice(0, 200)); }
+    }
+    const img = await generateImage(drawPrompt, { width: req.width, height: req.height, cool: state.cool, budgetMs: Math.max(15000, 50000 - (Date.now() - started)), styleFrom: req.prompt });
     state.cool = Object.fromEntries(Object.entries(state.cool || {}).filter(([, v]) => v > Date.now()));
     log('image', img.ok ? 'ok' : 'failed', JSON.stringify(img.tried), img.ms + 'ms');
     if (!img.ok) {
@@ -1039,7 +1080,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     state.history.push({ role: 'model', text: `[I made and sent Michael a picture: ${req.prompt.slice(0, 300)}]`, at: now() });
     await syncSched(state, kb, ctx);
     await Promise.all([saveState(from, state, ctx), kbDirty ? saveKB(from, kb, ctx) : null]);
-    return { reply: caption, image: { provider: img.provider, model: img.model, bytes: img.bytes.length, mime: img.mime, ms: img.ms, tried: img.tried } };
+    return { reply: caption, image: { provider: img.provider, model: img.model, bytes: img.bytes.length, mime: img.mime, ms: img.ms, tried: img.tried, scene: drawPrompt !== req.prompt ? drawPrompt.slice(0, 400) : null } };
   };
 
   // ---------- v6: AGENT MODE (background jobs, build sites & apps) ----------
@@ -1206,6 +1247,12 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       const rq = R.detectResearch(t);
       if (rq) return startJob('research', { brief: rq.topic.slice(0, 300), topic: rq.topic, pdf: rq.pdf }, +(process.env.RESEARCH_DAILY_LIMIT || 6), ['research'],
         id => `On it 🔎 Deep research: _${rq.topic.slice(0, 140)}_\nI'll run ~10 searches, read the best pages and send a summary with sources${rq.pdf ? ' + a PDF report' : ''}. 3–6 min.\n_Job #${id}_`);
+      // --- v9.8: royals (today's RPC posts again via the gate) · royals on | off | status ---
+      const rpp = RPC.detect(t);
+      if (rpp && isOwner) {
+        try { const rr = await RPC.command(ctx, rpp.op, {}); if (ctx.test) ctx.rpcCmd = rpp.op; return finish(rr.text, null, null); }
+        catch (e) { log('royals cmd failed', e.message); return finish('Couldn\'t reach the Royals posts just now. Try again in a minute.', null, null); }
+      }
       // --- v9.2: sow pings on | off | status (before Sow posts: "sow pings off" must never become a post) ---
       const spp = SPING.detect(t);
       if (spp) {
@@ -1422,7 +1469,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     if (v7) return v7;
     const ai = await agentIntent(userText);                   // v6: build / edit / agent jobs, jobs, my sites, zip, apk
     if (ai) return ai;
-    if (state.remPending && Date.now() - state.remPending.at < 20 * 60e3 && R8.looksLikeAnswer(userText) && !V.parseReminder(userText)) {
+    if (state.remPending && Date.now() - state.remPending.at < V97.REM_PENDING_MS && V97.pendingAnswer(userText) && !V.parseReminder(userText)) {   // v9.7: was 20 min + any 'today'
       const req = state.remPending.text; state.remPending = null;           // v8: "the three time" / "8pm" answers the reminder question
       const res = R8.resolveAnswer(req, userText);
       if (res) return reminderFlow(res, `${req} → ${userText}`);
@@ -1432,7 +1479,8 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       }
     }
     state.remPendingReasked = false;
-    const pr = R8.parseAny(userText);                        // v8: several times in one request first, then the v5 parser
+    const remQ = V97.remindQuestion(userText);               // v9.7: "remind me what my newsletter is called" is a question
+    const pr = remQ ? null : R8.parseAny(userText);          // v8: several times in one request first, then the v5 parser
     if (pr) return reminderFlow(pr, userText);
     const im = detectImage(userText);
     if (im) return imageFlow(im, userText);
@@ -1525,7 +1573,8 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   const rt = BR.route(userText, media, state, { cool: state.cool });
   const rAsk = msg.type === 'text' ? V93.replyAsk(msg, userText) : null;   // v9.3: "reply to this" / a forwarded message -> 3 replies
   const voice = V.needsVoice(userText) || Boolean(rAsk);
-  let extra = (rAsk ? V93.REPLY_EXTRA(rAsk) : '') + (/\b(remind|reminder|reminders|alarm|alert|set (?:it|them))\b/i.test(userText) || (state.history || []).slice(-4).some(h => /remind/i.test(h.text || '')) ? V93.remindersBlock(V.active(kb), d => V.fmtWhen(d)) : '');   // v9.3
+  const remQ97 = msg.type === 'text' && V97.remindQuestion(userText);   // v9.7: "remind me what …" -> answer it, no reminder talk
+  let extra = (rAsk ? V93.REPLY_EXTRA(rAsk) : '') + (remQ97 ? V97.REMIND_Q_EXTRA : '') + (!remQ97 && /\b(remind|reminder|reminders|alarm|alert|set (?:it|them))\b/i.test(userText) || (state.history || []).slice(-4).some(h => /remind/i.test(h.text || '')) ? V93.remindersBlock(V.active(kb), d => V.fmtWhen(d)) : '');   // v9.3
   const cAsk = msg.type === 'text' && !rAsk ? V96.codeAsk96(userText) : null;   // v9.5: coding asks get a focused checklist + more room
   const pAsk = msg.type === 'text' && !rAsk && !cAsk && V96.promptAsk96(userText);   // v9.5: image prompt / design-idea asks
   if (ctx.test) ctx.skill = cAsk ? 'code:' + cAsk : pAsk ? 'image-prompt' : null;
@@ -1541,7 +1590,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   if (cAsk) extra += V95.CODE_EXTRA(cAsk, userText) + V96.CODE_EXTRA96(cAsk, userText);   // v9.6: the task instructions come last (after the notes)
   if (pAsk) extra += V95.PROMPT_EXTRA + V96.PROMPT_EXTRA96(userText);
   if (ctx.test) ctx.route = rt;
-  const ansP = askGemini(state.history, kb.facts, userParts, started, { cool: state.cool, track: state, media, chain: cAsk ? BR.codeChain() : pAsk ? BR.promptChain(rt) : BR.chainFor(rt), deep: rt.level === 'hard', extra, lean: !media && !rAsk && !cAsk, query: userText, ...(userText === '[voice note]' || cAsk ? { maxTokens: 8192 } : {}), ...(cAsk ? { temperature: 0.3, thinking: 'medium', firstMs: 32000 } : {}) });   // v9: room for transcript + a full article
+  const ansP = askGemini(state.history, kb.facts, userParts, started, { cool: state.cool, track: state, media, chain: cAsk ? BR.codeChain() : pAsk ? BR.promptChain(rt) : BR.chainFor(rt), deep: rt.level === 'hard', extra, lean: !media && !rAsk && !cAsk, query: userText, quality: userText === '[voice note]' ? '' : String(userText || ''), ...(userText === '[voice note]' || cAsk ? { maxTokens: 8192 } : {}), ...(cAsk ? { temperature: 0.3, thinking: 'medium', firstMs: 32000 } : {}) });   // v9.7: quality -> weak answers fall through   // v9: room for transcript + a full article
   const memoP = msg.type === 'text' && !cAsk && !pAsk && BR.wantsMemory(userText) ? autoMemory(userText, kb, started) : null;   // v9.5: bug reports and design briefs are not facts about him   // beside the answer, not before it
   const ans = await ansP;
   state.cool = Object.fromEntries(Object.entries(ans.cool || {}).filter(([, v]) => v > Date.now()));
@@ -1585,7 +1634,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   // v8: the chat model can't set reminders or send things. A reply that claims it did is turned into the real action
   // (reminder found in this message or the last 20 min) or into an honest line. Never passed on as is.
   const claim = R8.claimsAction(modelText);
-  if (claim && !rAsk && (!V.needsVoice(userText) || (claim.kind === 'reminder' && /\bremind/i.test(userText)))) {   // v9.3: "remind me … post …" is still checked
+  if (claim && !rAsk && !remQ97 && (!V.needsVoice(userText) || (claim.kind === 'reminder' && /\bremind/i.test(userText)))) {   // v9.3: "remind me … post …" is still checked
     if (claim.kind === 'reminder') {
       const req = R8.recentRequest([...state.history, { role: 'user', text: userText, at: Date.now() }]);
       let res = R8.parseAny(String(userText).replace(/^\[voice note\]\s*/i, ''));
@@ -1598,7 +1647,7 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       modelText += '\n\n_⚠️ Nothing was actually sent or posted from this chat. To post: *post <text>* or *schedule <when> <text>*; email: *newsletter <text>*._';
     }
     if (ctx.test) ctx.claim = claim;
-  } else if (/\?/.test(modelText) && /\bremind/i.test(userText) && /\b(time|when|which)\b/i.test(modelText)) {
+  } else if (!remQ97 && /\?/.test(modelText) && /\bremind/i.test(userText) && /\b(time|when|which)\b/i.test(modelText)) {
     state.remPending = { text: String(userText).replace(/^\[voice note\]\s*/i, ''), at: Date.now() };   // the model asked a reminder question: his answer goes to the reminder flow
   }
   let out = toWhatsApp(modelText);
@@ -1615,8 +1664,52 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
   return finish(out, userText, modelText);
 }
 
+// ---------- v9.7: long-term memory (daily, from the 06:00 UTC cron before the brief; task=memory runs it alone) ----------
+export async function longTermMemory(ctx = liveCtx(), { force = false } = {}) {
+  const owner = ALLOWED()[0];
+  if (!owner) return { skipped: 'no_owner' };
+  const [state, kb0] = await Promise.all([loadState(owner, ctx), loadKB(owner, ctx)]);
+  const since = force ? 0 : (kb0.settings.ltmAt || 0);
+  const tr = V97.ltmTranscript(state.history, since);
+  if (tr.users < (force ? 1 : 2)) return { skipped: 'nothing_new', new_messages: tr.users };
+  const ans = await askGemini([], [], [{ text: V97.ltmPrompt(tr.text, kb0.facts) }], Date.now(), { cool: { ...(state.cool || {}) }, chain: BR.chainFor({ chain: 'hard' }), maxTokens: 1500, temperature: 0.2, system: 'You keep a personal assistant\'s long-term memory. Output only JSON.', src: 'ltm' });
+  if (!ans.ok) return { skipped: 'ai_busy', tried: ans.tried };
+  const kb = await loadKB(owner, ctx);                         // fresh copy: he may have taught something meanwhile
+  const res = V97.applyLtm(kb, V97.parseLtm(ans.text), { similar: BR.similar, looksSecret: BR.looksSecret, michaelText: tr.mine });
+  kb.settings.ltmAt = tr.last; kb.settings.ltmRun = new Date().toISOString();
+  await saveKB(owner, kb, ctx);
+  log('long-term memory', JSON.stringify({ ...res, model: ans.model }));
+  return { ok: true, ...res, model: ans.model, new_messages: tr.users, learned_total: kb.facts.filter(f => f.ltm).length };
+}
+
 // ---------- morning nudge (Vercel Cron, once a day) ----------
 const lagosDate = (t = Date.now()) => new Date(t).toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' });
+// v9.7: the morning brief's live data (each source optional; a slow or failed source is left out, never blocks the brief)
+const within = (p, ms = 6000) => Promise.race([Promise.resolve(p).catch(() => null), new Promise(r => setTimeout(() => r(null), ms))]);
+export async function briefData(owner, state, kb, ctx, now = Date.now(), sunday = false) {
+  const ns = J.nsOf(ctx), day = lagosDate(now), wk = 7 * 864e5;
+  const d = { reminders: V.active(kb).filter(r => lagosDate(r.due) === day).slice(0, 6).map(r => ({ when: V.fmtWhen(r.due), text: String(r.text).slice(0, 80) })) };
+  let jl = null, st = null;
+  if (J.jobsOn()) {
+    const [a, b, up, subs] = await Promise.all([within(J.rpc('list', { ns, owner, limit: 12 })), within(NL.rpc('status', { ns })), within(NL.rpc('upcoming', { ns, n: 1 })), within(NL.rpc('subs_count', {}))]);
+    jl = Array.isArray(a) ? a : null; st = b && typeof b === 'object' ? b : null;
+    if (jl) d.jobs = jl.filter(j => j.status === 'queued' || j.status === 'running').slice(0, 3).map(j => ({ id: j.id, kind: j.kind, brief: String(j.brief || '').replace(/\s+/g, ' ').slice(0, 60), status: j.status }));
+    if (st || (Array.isArray(up) && up.length) || typeof subs === 'number') d.letter = { last: st ? { subject: st.subject, status: st.status, sent: st.sent || 0, total: st.total || 0, queued: st.queued || 0, failed: st.failed || 0 } : null, next: Array.isArray(up) && up[0] ? { on: up[0].send_on, subject: up[0].subject } : null, subs: typeof subs === 'number' ? subs : null };
+  }
+  d.recent = (state.history || []).filter(h => h.role === 'user' && now - (h.at || 0) < 48 * 3600e3).slice(-8).map(h => String(h.text || '').replace(/\s+/g, ' ').slice(0, 160));
+  if (sunday) {
+    const mine = (state.history || []).filter(h => h.role === 'user' && now - (h.at || 0) < wk);
+    const oldest = (state.history || [])[0];
+    const ts = j => Date.parse(j.updated || j.finished_at || j.created || '') || 0;
+    d.week = { msgs: mine.length, msgsCapped: Boolean(oldest && now - (oldest.at || now) < wk && (state.history || []).length >= MAX_TURNS * 2),
+      reminders: (kb.reminders || []).filter(r => r.sentAt && now - r.sentAt < wk).length,
+      learned: (kb.facts || []).filter(f => (f.ltm || f.auto) && now - (Date.parse(f.at) || 0) < wk).length,
+      letterSent: st && now - (Date.parse(st.started_at || '') || 0) < wk ? st.sent || 0 : null,
+      jobsDone: jl ? jl.filter(j => j.status === 'done' && now - ts(j) < wk).length : null };
+  }
+  return d;
+}
+
 const FALLBACK_FOCUS = [
   'Message 3 small businesses with your portfolio (olaoluwa-studio.vercel.app) and price list',
   'Post one Faith & Film moment on Facebook this evening',
@@ -1626,7 +1719,7 @@ const FALLBACK_FOCUS = [
   'Draft the next Bible manga episode',
   'One Holy humour Reel idea: film it in 10 minutes',
 ];
-export async function morningNudge(ctx = liveCtx(), { force = false } = {}) {
+export async function morningNudge(ctx = liveCtx(), { force = false, sunday: sundayTest = null } = {}) {
   const owner = ALLOWED()[0];
   if (!owner) return { skipped: 'no_owner' };
   const [state, kb] = await Promise.all([loadState(owner, ctx), loadKB(owner, ctx)]);
@@ -1637,27 +1730,29 @@ export async function morningNudge(ctx = liveCtx(), { force = false } = {}) {
   // Meta only delivers free-form messages within 24h of his last message; don't even try outside it.
   if (!lastIn || Date.now() - lastIn > 23.5 * 3600e3) return { skipped: 'outside_24h_window', last_message_hours_ago: lastIn ? Math.round((Date.now() - lastIn) / 36e5) : null };
   const day = new Date().toLocaleDateString('en-GB', { timeZone: 'Africa/Lagos', weekday: 'long', day: 'numeric', month: 'long' });
-  const prev = state.history.filter(h => h.role === 'model' && h.nudge).slice(-1)[0]?.text || '';
-  const ask = `It's ${day}, early morning in Nigeria. Write Michael's daily morning nudge on WhatsApp. Exactly this shape:
-Good morning Michael 🌅
-*Today's focus:*
-• (2 or 3 short, concrete actions picked from his CURRENT PRIORITY, open to-dos and taught facts; money/clients first)
-Then one short line of encouragement or one short Bible verse quoted exactly (KJV) with its reference.
-Max 70 words. Talk to him as his assistant.${prev ? ` Don't repeat yesterday's actions: """${prev.slice(0, 500)}"""` : ''}`;
-  const ans = await askGemini([], kb.facts, [{ text: ask }], Date.now(), { cool: state.cool, track: state, chain: LITE_FIRST, maxTokens: 2048 });
+  // v9.7: live data first, never an item from the last 3 briefs, Sunday week review
+  const sunday = ctx.test && sundayTest != null ? sundayTest : V97.isSundayLagos();   // sandbox can preview the Sunday review
+  const data = await briefData(owner, state, kb, ctx, Date.now(), sunday);
+  const recent = V97.recentBullets(state.history, 3);
+  const ask = V97.briefPrompt(day, V97.briefDataText(data, sunday), recent, sunday);
+  const ans = await askGemini([], kb.facts, [{ text: ask }], Date.now(), { cool: state.cool, track: state, chain: BR.chainFor({ chain: 'hard' }), maxTokens: 2048, quality: ask.slice(0, 80) });
   state.cool = Object.fromEntries(Object.entries(ans.cool || {}).filter(([, v]) => v > Date.now()));
-  let text;
-  if (ans.ok) text = toWhatsApp(ans.text);
-  else {
-    const n = Number(today.slice(-2));
-    text = `Good morning Michael 🌅\n\n*Today's focus:*\n• ${FALLBACK_FOCUS[n % FALLBACK_FOCUS.length]}\n• ${FALLBACK_FOCUS[(n + 3) % FALLBACK_FOCUS.length]}\n\nYou've got this. One step at a time 💪`;
+  let text, removed = [];
+  const n = Number(today.slice(-2));
+  if (ans.ok) {
+    const f = V97.staleFilter(toWhatsApp(ans.text), recent, V97.similarItem);
+    removed = f.removed; text = f.text;
+    if (!V97.bulletsOf(text).length) text = null;               // everything it wrote was a repeat: build it from the data instead
   }
+  const fromData = !text;
+  if (!text) text = V97.briefFallback(data, { sunday, focus: FALLBACK_FOCUS, recent, similar: V97.similarItem, seed: n });
+  if (removed.length) log('brief: dropped repeated items', JSON.stringify(removed));
   const r = await sendText(owner, text, ctx);
   if (!r.ok) { log('nudge not delivered (handled quietly)', r.status || '', (r.detail || '').slice(0, 200)); return { skipped: 'meta_refused', status: r.status }; }
   state.history.push({ role: 'model', text, at: Date.now(), nudge: true });
   kb.settings.lastNudge = today;
   await Promise.all([saveState(owner, state, ctx), saveKB(owner, kb, ctx)]);
-  return { sent: true, text, model: ans.model || 'fallback' };
+  return { sent: true, text, model: fromData ? 'fallback' : ans.model, removed, data_used: Object.keys(data).filter(k => data[k] && (!Array.isArray(data[k]) || data[k].length)) };
 }
 
 // ---------- HTTP ----------
@@ -1683,7 +1778,7 @@ export async function GET(request) {
   const p = u.searchParams;
   if (p.get('health') === '1') {
     const has = k => Boolean(process.env[k]);
-    return Response.json({ ok: true, version: 2, build: V96.BUILD, v96: { patch: V96.PATCH, coding: 'code asks -> ' + BR.codeChain().slice(0, 6).join(' > ') + ' …; temp 0.3, medium thinking, first model 32 s even after a fast pro refusal; complete templates retrieved (3000 chars each)', images: 'format notes (flyer/status/thumbnail/square/book cover/banner), vague-brief default, draw-Michael route', knowhow: ['knowhow:debug-cases', 'knowhow:templates', 'knowhow:code96', 'knowhow:image-formats', 'knowhow:image-examples96', 'knowhow:image-playbook'] }, v95: { coding: 'coding asks -> strong model, checklist (ask for the error, one-line cause, complete files, numbered steps), 8K output, fenced splitting', image_prompts: 'prompt-craft rules + "write me a prompt" -> ready image: lines', image_feedback: 'again / brighter / make it … within 30 min redraws the last picture', face_rule: 'never draws Michael (picture bank)', brand_looks: ['retain', 'nigerian', 'blossom', 'faith', 'thumbnail'], knowhow: ['knowhow:code', 'knowhow:imagecraft', 'voice:*'] }, v93: { retrieval: 'taught facts picked per message (topics + keywords + pinned + newest), lean ' + V93.LEAN_BUDGET + ' / full ' + V93.FULL_BUDGET + ' chars', skills: ['images', 'coding', 'video (honest)', 'reply drafts x3', 'know-how bank (knowhow:* in kchunks)'], knowledge_view: true }, v9: { outreach: true, template: V9.TPL_NAME(), autoreply: true, voice_polish: true, growth_nudge: 'monday 08:00 lagos', digest: '20:00 lagos' }, v8: { routing: 'rules: easy -> lite, hard -> strong (gemini-3.6-flash family) while ' + BR.STRONG_PER_KEY() + '/key/day lasts, then lite + step-by-step', strong_per_key: BR.STRONG_PER_KEY(), providers: ['gemini', ...PV.available()], provider_env: ['GROQ_API_KEY', 'OPENROUTER_API_KEY'], keys: G.keys().filter(k => k.v).length, key_env: ['GEMINI_API_KEY', 'GEMINI_API_KEY_2'], retrieval: BR.brainOn() ? 'gemini-embedding-001 768d in supabase pgvector michael_ai.kchunks' : 'off', auto_memory: true, fresh_search: true, vision: 'photos + PDFs/Office via gemini (since v4/v5.1)', cmds: ['brain', 'learn <text|link>', 'learned', 'unlearn <n>', 'sow', 'sow week', 'sow <day>', 'posted <platform>', 'add a post for <when> about <topic>'], sow: SP.sowApiOn() ? 'sow api + sp_posts' : 'sp_posts only (SOW_API_KEY missing)' }, v72: { daily_verse: VS.verseOn() ? 'sow /api/today -> 06:00 Lagos via pg_cron gate row verse (24h window only, once a day)' : 'off (SOW_API_KEY missing)', verse_cmd: ['verse', 'today', 'daily verse'] }, v92: { sow_pings: 'sow-ng cron -> /api/cron?task=sowping (x-sow-key); window shut -> held, one summary on his next message; fails once/day per platform+reason; cmds sow pings on|off' }, v91: { nl_preview: 'full letter at 20:00 Lagos; window shut -> approved template nudge (' + NL.PREVIEW_TEMPLATES().join(' | ') + ') + held until his next message' }, v71: { newsletter: NL.nlOn() ? 'monday & friday letters, 08:00 Lagos via pg_cron gate row newsletter' : 'off (store env missing)', newsletter_mail: NL.mailOn(), newsletter_cmds: ['letters', 'skip', 'unskip', 'subs', 'newsletter <text>'], newsletter_reserve: NL.RESERVE() }, v7: { site_backend: J.jobsOn(), site_data_api: '/api/site-data', payments: B.paymentsOn() ? 'paystack on' : 'built, off (no Paystack keys yet)', repos: GR.repoOn(), repo_branch_prefix: 'mai/', repo_protected: GR.PROTECTED(), research: J.jobsOn(), research_pdf: true, media: 'ffmpeg via /api/media', sow_posts: SOW.sowOn(), gemini_key2: G.keys().filter(k => k.v).length > 1, quota_cmd: true, apk: 'real signed APK via PWABuilder cloud packager (no account), hosted at <site>/app.apk' }, storage: J.jobsOn() ? 'supabase kv (blob read-fallback)' : (has('BLOB_READ_WRITE_TOKEN') ? 'vercel blob' : 'none'), gemini_keys: G.keys().filter(k => k.v).length, agent: J.jobsOn() && has('VERCEL_TOKEN') && has('GEMINI_API_KEY'), jobs: J.jobsOn(), deploy: has('VERCEL_TOKEN'), builds_daily_limit: J.BUILD_DAILY_LIMIT(), agent_tools: ['web_search', 'web_read', 'make_image', 'build_site', 'remember', 'send_update'], job_runner: 'supabase michael_ai.jobs + pg_cron michael-ai-jobs (every minute) + self-chain, 300 s per tick', file_read: true, file_types: ['pdf', 'docx', 'xlsx', 'pptx', 'txt/csv/md/json/html', 'image (photo of a page)'], file_ocr: 'gemini inline (lite-first rotation) for scans/photos, max ' + Math.round(F.MAX_INLINE / 1048576) + ' MB', file_max_mb: Math.round(F.MAX_DOWNLOAD / 1048576), file_text_cap: F.FILE_CAP, reminders: true, scheduler: V.schedOn() ? 'supabase pg_cron (every minute, wakes only when due) + daily vercel cron + on each message' : 'daily vercel cron + on each message (gate env missing)', reminder_tz: 'Africa/Lagos', search: 'keyless: duckduckgo -> bing -> ddg-lite (+ google-news-rss, wikipedia) -> gemini summary with 1-3 sources', search_daily_limit: V.SEARCH_LIMIT(), models: { hard: V.HARD_CHAIN, easy: V.EASY_CHAIN }, usage_cmd: true, kb_limit: KB_LIMIT, multi_teach: true, read_links: true, image_gen: primaryProvider(), image_fallback: providerList().includes('pollinations-free') ? 'pollinations-free (keyless, best-effort)' : 'off', image_providers: providerList(), img_daily_limit: +(process.env.IMG_DAILY_LIMIT || 20), verify_token: has('WA_VERIFY_TOKEN'), wa_token: has('WA_TOKEN'), phone_id: has('WA_PHONE_ID'), app_secret: has('WA_APP_SECRET'), store: has('BLOB_READ_WRITE_TOKEN'), gemini: has('GEMINI_API_KEY'), owner_only: ALLOWED().length > 0, test_key: has('WA_TEST_KEY'), cron_secret: has('CRON_SECRET'), fb_page: fbConfigured(), profile_words: PROFILE.split(/\s+/).length, dry_run: DRY(), graph: process.env.WA_GRAPH_VERSION || 'v26.0' });
+    return Response.json({ ok: true, version: 2, build: 'v9.8', v98: RPC.health(), v97: V97.health(), v96: { patch: V96.PATCH, coding: 'code asks -> ' + BR.codeChain().slice(0, 6).join(' > ') + ' …; temp 0.3, medium thinking, first model 32 s even after a fast pro refusal; complete templates retrieved (3000 chars each)', images: 'format notes (flyer/status/thumbnail/square/book cover/banner), vague-brief default, draw-Michael route', knowhow: ['knowhow:debug-cases', 'knowhow:templates', 'knowhow:code96', 'knowhow:image-formats', 'knowhow:image-examples96', 'knowhow:image-playbook'] }, v95: { coding: 'coding asks -> strong model, checklist (ask for the error, one-line cause, complete files, numbered steps), 8K output, fenced splitting', image_prompts: 'prompt-craft rules + "write me a prompt" -> ready image: lines', image_feedback: 'again / brighter / make it … within 30 min redraws the last picture', face_rule: 'never draws Michael (picture bank)', brand_looks: ['retain', 'nigerian', 'blossom', 'faith', 'thumbnail'], knowhow: ['knowhow:code', 'knowhow:imagecraft', 'voice:*'] }, v93: { retrieval: 'taught facts picked per message (topics + keywords + pinned + newest), lean ' + V93.LEAN_BUDGET + ' / full ' + V93.FULL_BUDGET + ' chars', skills: ['images', 'coding', 'video (honest)', 'reply drafts x3', 'know-how bank (knowhow:* in kchunks)'], knowledge_view: true }, v9: { outreach: true, template: V9.TPL_NAME(), autoreply: true, voice_polish: true, growth_nudge: 'monday 08:00 lagos', digest: '20:00 lagos' }, v8: { routing: 'rules: easy -> lite, hard -> strong (gemini-3.6-flash family) while ' + BR.STRONG_PER_KEY() + '/key/day lasts, then lite + step-by-step', strong_per_key: BR.STRONG_PER_KEY(), providers: ['gemini', ...PV.available()], provider_env: ['GROQ_API_KEY', 'OPENROUTER_API_KEY'], keys: G.keys().filter(k => k.v).length, key_env: ['GEMINI_API_KEY', 'GEMINI_API_KEY_2'], retrieval: BR.brainOn() ? 'gemini-embedding-001 768d in supabase pgvector michael_ai.kchunks' : 'off', auto_memory: true, fresh_search: true, vision: 'photos + PDFs/Office via gemini (since v4/v5.1)', cmds: ['brain', 'learn <text|link>', 'learned', 'unlearn <n>', 'sow', 'sow week', 'sow <day>', 'posted <platform>', 'add a post for <when> about <topic>'], sow: SP.sowApiOn() ? 'sow api + sp_posts' : 'sp_posts only (SOW_API_KEY missing)' }, v72: { daily_verse: VS.verseOn() ? 'sow /api/today -> 06:00 Lagos via pg_cron gate row verse (24h window only, once a day)' : 'off (SOW_API_KEY missing)', verse_cmd: ['verse', 'today', 'daily verse'] }, v92: { sow_pings: 'sow-ng cron -> /api/cron?task=sowping (x-sow-key); window shut -> held, one summary on his next message; fails once/day per platform+reason; cmds sow pings on|off' }, v91: { nl_preview: 'full letter at 20:00 Lagos; window shut -> approved template nudge (' + NL.PREVIEW_TEMPLATES().join(' | ') + ') + held until his next message' }, v71: { newsletter: NL.nlOn() ? 'monday & friday letters, 08:00 Lagos via pg_cron gate row newsletter' : 'off (store env missing)', newsletter_mail: NL.mailOn(), newsletter_cmds: ['letters', 'skip', 'unskip', 'subs', 'newsletter <text>'], newsletter_reserve: NL.RESERVE() }, v7: { site_backend: J.jobsOn(), site_data_api: '/api/site-data', payments: B.paymentsOn() ? 'paystack on' : 'built, off (no Paystack keys yet)', repos: GR.repoOn(), repo_branch_prefix: 'mai/', repo_protected: GR.PROTECTED(), research: J.jobsOn(), research_pdf: true, media: 'ffmpeg via /api/media', sow_posts: SOW.sowOn(), gemini_key2: G.keys().filter(k => k.v).length > 1, quota_cmd: true, apk: 'real signed APK via PWABuilder cloud packager (no account), hosted at <site>/app.apk' }, storage: J.jobsOn() ? 'supabase kv (blob read-fallback)' : (has('BLOB_READ_WRITE_TOKEN') ? 'vercel blob' : 'none'), gemini_keys: G.keys().filter(k => k.v).length, agent: J.jobsOn() && has('VERCEL_TOKEN') && has('GEMINI_API_KEY'), jobs: J.jobsOn(), deploy: has('VERCEL_TOKEN'), builds_daily_limit: J.BUILD_DAILY_LIMIT(), agent_tools: ['web_search', 'web_read', 'make_image', 'build_site', 'remember', 'send_update'], job_runner: 'supabase michael_ai.jobs + pg_cron michael-ai-jobs (every minute) + self-chain, 300 s per tick', file_read: true, file_types: ['pdf', 'docx', 'xlsx', 'pptx', 'txt/csv/md/json/html', 'image (photo of a page)'], file_ocr: 'gemini inline (lite-first rotation) for scans/photos, max ' + Math.round(F.MAX_INLINE / 1048576) + ' MB', file_max_mb: Math.round(F.MAX_DOWNLOAD / 1048576), file_text_cap: F.FILE_CAP, reminders: true, scheduler: V.schedOn() ? 'supabase pg_cron (every minute, wakes only when due) + daily vercel cron + on each message' : 'daily vercel cron + on each message (gate env missing)', reminder_tz: 'Africa/Lagos', search: 'keyless: duckduckgo -> bing -> ddg-lite (+ google-news-rss, wikipedia) -> gemini summary with 1-3 sources', search_daily_limit: V.SEARCH_LIMIT(), models: { hard: V.HARD_CHAIN, easy: V.EASY_CHAIN }, usage_cmd: true, kb_limit: KB_LIMIT, multi_teach: true, read_links: true, image_gen: primaryProvider(), image_fallback: providerList().includes('pollinations-free') ? 'pollinations-free (keyless, best-effort)' : 'off', image_providers: providerList(), img_daily_limit: +(process.env.IMG_DAILY_LIMIT || 20), verify_token: has('WA_VERIFY_TOKEN'), wa_token: has('WA_TOKEN'), phone_id: has('WA_PHONE_ID'), app_secret: has('WA_APP_SECRET'), store: has('BLOB_READ_WRITE_TOKEN'), gemini: has('GEMINI_API_KEY'), owner_only: ALLOWED().length > 0, test_key: has('WA_TEST_KEY'), cron_secret: has('CRON_SECRET'), fb_page: fbConfigured(), profile_words: PROFILE.split(/\s+/).length, dry_run: DRY(), graph: process.env.WA_GRAPH_VERSION || 'v26.0' });
   }
   const want = process.env.WA_VERIFY_TOKEN || '';
   if (p.get('hub.mode') === 'subscribe' && want && p.get('hub.verify_token') === want) {

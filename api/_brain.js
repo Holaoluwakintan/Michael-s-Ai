@@ -96,10 +96,12 @@ export function route(text, media, state, opts = {}) {
 export function chainFor(rt) {
   const ps = P.strongChain(), pf = P.fastChain();
   if (rt.chain === 'code') return codeChain();
-  if (rt.chain === 'hard') return [...V.SMART, ...ps, ...V.LITE, ...pf, ...V.GEMMA];
-  if (rt.chain === 'alt') return [...ps, ...V.LITE, ...pf, ...V.GEMMA];
-  if (rt.chain === 'deep') return [...V.LITE, ...pf, ...V.GEMMA, ...V.SMART];
-  return [...V.LITE, ...pf, ...V.GEMMA, ...V.SMART, ...ps];
+  // v9.7: Groq's gpt-oss-120b answered every probe this week, so it comes right after the two Flash models that work (hard) and right
+  // after Lite (easy), ahead of the busy Flash models and the 429 Gemma. askGemini then moves today's failing models to the back.
+  if (rt.chain === 'hard') return [...V.SMART.slice(0, 2), ...ps, ...V.SMART.slice(2), ...V.LITE, ...pf, ...V.GEMMA];
+  if (rt.chain === 'alt') return [...ps, ...V.LITE, ...pf, ...V.SMART.slice(0, 2), ...V.GEMMA];
+  if (rt.chain === 'deep') return [...V.LITE, ...ps, ...pf, ...V.SMART, ...V.GEMMA];
+  return [...V.LITE, ...ps, ...pf, ...V.SMART, ...V.GEMMA];
 }
 // v9.6 (Michael, 12 Oct: "make it super super smart"): coding asks always start with the heaviest model this key can use.
 // Pro first (free keys get 429 "limit: 0" -> parked until Google's daily reset, so it costs one fast call a day; it answers

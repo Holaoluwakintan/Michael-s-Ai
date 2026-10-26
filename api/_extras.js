@@ -2,6 +2,7 @@
 // No heavy deps: fetch + regex text extraction. Env (all optional): POLLINATIONS_KEY (+ POLLINATIONS_MODEL, default flux),
 // CF_ACCOUNT_ID + CF_AI_TOKEN (Cloudflare Workers AI flux-1-schnell), IMG_DAILY_LIMIT (default 20), GEMINI_API_KEY (Gemini image, tried only
 // when not parked; Google's free tier gives image models "limit: 0", so a 429 parks it until midnight Pacific).
+import * as V97 from './_v97.js';   // v9.7: image prompt cleanup + model order
 import { brandStyle95 } from './_v95.js';   // v9.5
 
 export const PAGE_CAP = 30000;            // chars of page text kept for the model
@@ -265,7 +266,7 @@ export function countImage(state, now = Date.now()) {
   const day = pacificDay(now);
   state.img = state.img && state.img.day === day ? { day, n: state.img.n + 1 } : { day, n: 1 };
 }
-const STYLE = ', high quality, sharp focus, clean composition, vivid natural colors, no text, no letters, no watermark';
+const STYLE_BASE = ', high quality, sharp focus, clean composition, vivid natural colors';   // v9.7: the no-text / no-UI part comes from V97.imageStyle
 function nextMidnightPT(now = Date.now()) {
   const d = new Date(now);
   const pt = new Date(d.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
@@ -284,17 +285,31 @@ export function providerList(env = process.env) {
 // health: the keyed provider in use, else "pending_key" (the keyless Pollinations fallback is best-effort and reported apart)
 export function primaryProvider(env = process.env) { return providerList(env).find(p => p === 'pollinations' || p === 'cloudflare') || 'pending_key'; }
 
-async function tryProvider(p, prompt, w, h, seed, ms) {
-  const full = prompt + brandStyle(prompt) + STYLE;   // v9.3: brand/faith/thumbnail/poster looks
+// v9.7: the full prompt sent to every image model: platform words that invite fake UI are reworded, brand looks added, and
+// "no text / no UI" unless he asked for exact words in quotes (then only those words)
+export function fullImagePrompt(prompt, styleFrom = prompt) {
+  const look = brandStyle(styleFrom).replace(/Blossom brand look: near-black and graphite with a dusty-rose accent/g, 'warm light with deep graphite shadows and a soft rose glow').replace(/,?\s*clear empty area for a title/g, '').replace(/,?\s*clean layout with generous empty space at the top for a headline/g, '');   // v9.7: "space for a title" became flat colour bands
+  return V97.stripNames(V97.cleanImagePrompt(prompt) + look, styleFrom) + STYLE_BASE + V97.imageStyle(prompt);
+}
+async function tryProvider(p, prompt, w, h, seed, ms, styleFrom = prompt) {
+  const full = fullImagePrompt(prompt, styleFrom);   // v9.3: brand/faith/thumbnail/poster looks · v9.7: no fake UI / garbled text
   if (p === 'pollinations' || p === 'pollinations-free') {
     const base = p === 'pollinations' ? 'https://gen.pollinations.ai/image/' : 'https://image.pollinations.ai/prompt/';
-    const model = p === 'pollinations' ? (process.env.POLLINATIONS_MODEL || 'flux') : 'flux';
-    const url = `${base}${encodeURIComponent(full.slice(0, 1500))}?width=${w}&height=${h}&seed=${seed}&nologo=true&safe=true&model=${encodeURIComponent(model)}`;
     const headers = p === 'pollinations' ? { authorization: `Bearer ${process.env.POLLINATIONS_KEY}` } : {};
-    const r = await timedFetch(url, { headers }, ms);
-    const ct = (r.headers.get('content-type') || '').split(';')[0];
-    if (!r.ok || !ct.startsWith('image/')) return { ok: false, status: r.status, detail: (await r.text().catch(() => '')).slice(0, 200) };
-    return { ok: true, bytes: Buffer.from(await r.arrayBuffer()), mime: ct, model: r.headers.get('x-model-used') || model };
+    const neg = encodeURIComponent(V97.negativePrompt(styleFrom));
+    const t0 = Date.now(); let last = { ok: false, status: 'no model' };
+    for (const model of V97.IMG_MODELS()) {               // v9.7: zimage (full size, clean) first, then flux
+      const left = ms - (Date.now() - t0);
+      if (left < 6000) break;
+      const url = `${base}${encodeURIComponent(full.slice(0, 1500))}?width=${w}&height=${h}&seed=${seed}&nologo=true&safe=true&model=${encodeURIComponent(model)}&negative_prompt=${neg}`;
+      let r;
+      try { r = await timedFetch(url, { headers }, left); } catch (e) { last = { ok: false, status: e.name === 'AbortError' ? 'timeout' : 'error', detail: e.message }; continue; }
+      const ct = (r.headers.get('content-type') || '').split(';')[0];
+      if (r.ok && ct.startsWith('image/')) return { ok: true, bytes: Buffer.from(await r.arrayBuffer()), mime: ct, model: r.headers.get('x-model-used') || model };
+      last = { ok: false, status: r.status, detail: (await r.text().catch(() => '')).slice(0, 200) };
+      if (r.status === 401 || r.status === 403) break;
+    }
+    return last;
   }
   if (p === 'cloudflare') {
     const r = await timedFetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell`, {
@@ -322,7 +337,7 @@ async function tryProvider(p, prompt, w, h, seed, ms) {
   return { ok: false, status: 'unknown provider' };
 }
 // -> { ok, bytes, mime, provider, model, tried } | { ok:false, tried, busy }
-export async function generateImage(prompt, { width = 1080, height = 1350, cool = {}, budgetMs = 42000, seed } = {}) {
+export async function generateImage(prompt, { width = 1080, height = 1350, cool = {}, budgetMs = 42000, seed, styleFrom = prompt } = {}) {
   const started = Date.now();
   const tried = [];
   seed = seed ?? Math.floor(Math.random() * 1e9);
@@ -333,7 +348,7 @@ export async function generateImage(prompt, { width = 1080, height = 1350, cool 
     const attempts = p === 'pollinations-free' ? 2 : 1;
     for (let a = 0; a < attempts; a++) {
       let res;
-      try { res = await tryProvider(p, prompt, width, height, seed + a, Math.min(p === 'gemini' ? 25000 : 35000, budgetMs - (Date.now() - started))); }
+      try { res = await tryProvider(p, prompt, width, height, seed + a, Math.min(p === 'gemini' ? 25000 : 35000, budgetMs - (Date.now() - started)), styleFrom); }
       catch (e) { res = { ok: false, status: e.name === 'AbortError' ? 'timeout' : 'error', detail: e.message }; }
       tried.push({ p, status: res.ok ? 200 : res.status });
       if (res.ok && res.bytes.length > 2000) return { ...res, provider: p, tried, ms: Date.now() - started };

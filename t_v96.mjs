@@ -129,7 +129,7 @@ ok('ordinary prompts pass both guards', !V96.realPerson('a Nigerian woman readin
 
 // ===== health =====
 { const res = await m.GET(new Request('http://x/api/whatsapp?health=1')); const j = await res.json();
-  ok('health: build v9.6 with the code chain listed', /^v9\.6/.test(j.build) && j.v96 && /gemini-3\.1-pro-preview > gemini-3\.6-flash/.test(j.v96.coding) && j.v95); }
+  ok('health: build v9.6+ with the code chain listed', /^v9\.([6-9]|\d\d)/.test(j.build) && j.v96 && /gemini-3\.1-pro-preview > gemini-3\.6-flash/.test(j.v96.coding) && j.v95); }
 
 await J.rpc('kv_purge_test', {});
 console.log(`\n${n} checks passed`);
