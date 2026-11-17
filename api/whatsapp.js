@@ -42,6 +42,7 @@ import * as NL from './_newsletter.js';
 import * as VS from './_verse.js';
 import * as EM from './_email.js';
 import * as EP from './_episode.js';
+import * as ST from './_story.js';
 
 export const config = { maxDuration: 60 };
 
@@ -1488,7 +1489,16 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       if (/^\s*(?:yes|save|looks good|done|confirm|approve)\s*[?.!]*\s*$/i.test(userText)) {
         state.episodePending = null;
         if (kb) { kb.activeDoc = p.docId; kb.currentEpisode = (kb.currentEpisode || 1) + 1; await saveKB(from, kb, ctx); }
-        return finish(`✅ *Episode saved!*\n${p.title || 'Episode'} is locked in and ready.\n\nSend *next episode* anytime to write the next part!`, userText, 'Episode approved.');
+        // Update story tracker state
+        try {
+          const st = await ST.loadStory(from);
+          st.currentEpisode = (st.currentEpisode || 1) + 1;
+          st.plotHistory = [...(st.plotHistory || []), `${p.title || 'Episode'}: ${p.text.slice(0, 180)}...`].slice(-15);
+          await ST.saveStory(from, st);
+        } catch (e) {}
+
+        const forwardReady = `*${p.title || 'Today\'s Episode'}*\n\n${p.text}\n\n—\n_Shared from Michael\'s Daily Stories_`;
+        return finish(`✅ *Episode saved!*\n\n${forwardReady}\n\n─────────────────────\n📲 *Channel Ready*: Tap *Forward* (➔) to send directly to your WhatsApp Channel!`, userText, 'Episode approved.');
       }
       if (/^\s*(?:cancel|drop|stop|nevermind|no)\s*[?.!]*\s*$/i.test(userText)) {
         state.episodePending = null;
@@ -1535,8 +1545,10 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       if (!docId) return finish('📄 Paste your Google Doc link with the command, e.g.:\n_make episode from https://docs.google.com/document/d/..._\n(Make sure sharing is set to *"Anyone with the link can view"*).', null, null);
       try {
         const docData = await EP.fetchDocText(docId);
-        const epNum = (kb?.currentEpisode || 1);
-        const epRes = await askGemini(state.history, kb.facts, [{ text: EP.episodePrompt(docData.text, query.replace(EP.DOC_LINK_RE, '').trim(), epNum) }], started, { cool: state.cool, track: state });
+        const storyState = await ST.loadStory(from);
+        const epNum = storyState?.currentEpisode || (kb?.currentEpisode || 1);
+        const storyCtx = ST.storyContinuityContext(storyState);
+        const epRes = await askGemini(state.history, kb.facts, [{ text: EP.episodePrompt(docData.text, query.replace(EP.DOC_LINK_RE, '').trim(), epNum, storyCtx) }], started, { cool: state.cool, track: state });
         state.cool = Object.fromEntries(Object.entries(epRes.cool || {}).filter(([, v]) => v > Date.now()));
         if (!epRes.ok) return finish('⚠️ I had trouble generating the episode just now. Try again in a minute.', null, null);
         const episodeText = epRes.text.trim();
@@ -1547,6 +1559,32 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       } catch (err) {
         return finish(`⚠️ ${err.message}`, null, null);
       }
+    }
+
+    // --- STORY BIBLE COMMANDS ---
+    if (ST.STORY_CMD_RE.test(userText)) {
+      if (!isOwner) return finish('Only Michael can view the story bible.', null, null);
+      const st = await ST.loadStory(from);
+      return finish(ST.formatStoryOverview(st), null, null);
+    }
+    const nsMatch = userText.match(ST.NEW_STORY_RE);
+    if (nsMatch) {
+      if (!isOwner) return finish('Only Michael can set the story.', null, null);
+      const title = nsMatch[1].trim();
+      const st = { title, currentEpisode: 1, characters: {}, plotHistory: [], openThreads: [] };
+      await ST.saveStory(from, st);
+      return finish(`📚 *New story started: ${title}*\nReset to Episode 1. Use _next episode_ or paste your Google Doc link to begin writing!`, userText, 'New story started.');
+    }
+    const charMatch = userText.match(ST.UPDATE_CHAR_RE);
+    if (charMatch) {
+      if (!isOwner) return finish('Only Michael can update characters.', null, null);
+      const name = charMatch[1].trim();
+      const desc = charMatch[2].trim();
+      const st = await ST.loadStory(from);
+      st.characters = st.characters || {};
+      st.characters[name] = desc;
+      await ST.saveStory(from, st);
+      return finish(`👤 *Character Updated:* ${name}\n_${desc}_\n\nSaved to the Story Bible.`, userText, 'Character updated.');
     }
     if (state.pending) {
       if (YES_RE.test(userText)) return publishFlow(userText);

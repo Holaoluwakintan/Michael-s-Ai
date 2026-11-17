@@ -48,14 +48,14 @@ export async function fetchDocText(urlOrId) {
 /**
  * Create prompt instructions for Gemini to draft the episode
  */
-export function episodePrompt(docText, instructions = '', episodeNumber = null) {
+export function episodePrompt(docText, instructions = '', episodeNumber = null, storyContext = '') {
   return `You are Michael AI, writing an episodic story or devotional episode for Olaoluwa Michael ("Michael").
 Write in Michael's signature storytelling voice:
 - Warm, vivid, relatable Nigerian storytelling with faith and human insight.
 - One thought per line rhythm, dialogue in quotes, balanced landing couplet.
 - Authentic Nigerian setting, gentle humor, and deep spiritual truth.
 
-Source Material from Michael's Google Doc:
+${storyContext ? storyContext + '\n' : ''}Source Material from Michael's Google Doc:
 """
 ${docText.slice(0, 25000)}
 """
