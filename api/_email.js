@@ -1,108 +1,85 @@
-// api/_email.js - Email search, drafting, and sending via Gmail API for Michael AI.
-// Follows the same modular architecture as _newsletter.js and _sow.js.
+// api/_email.js - Email drafting & sending via Brevo SMTP or Gmail API for Michael AI.
+// Allows Michael to send direct one-on-one emails through his existing Brevo account without breaking newsletters.
 
-export const EMAIL_RE = /^\s*(?:reply\s+to\s+mail|reply\s+to\s+email|reply\s+to|send\s+(?:an?\s+)?email\s+to|mail)\s+(.+)$/i;
-export const CHECK_MAIL_RE = /^\s*(?:check\s+(?:my\s+)?(?:mails?|emails?)|recent\s+emails?|inbox)\s*[?.!]*\s*$/i;
+export const EMAIL_RE = /^\s*(?:send\s+(?:an?\s+)?(?:email|mail)\s+to|mail|email\s+to|email)\s+([^\s@]+@[^\s@]+\.[^\s@]+)\s*(?:about|saying|that|with\s+message)?\s*([\s\S]*)$/i;
+export const GMAIL_REPLY_RE = /^\s*(?:reply\s+to\s+(?:mail|email)|reply\s+to)\s+(.+)$/i;
 export const YES_RE = /^\s*(?:yes|send|send\s+it|go\s+ahead|proceed|do\s+it|confirm|yup|yeah)\s*[?.!]*\s*$/i;
 export const CANCEL_RE = /^\s*(?:no|cancel|stop|drop|nevermind|don't\s+send|leave\s+it)\s*[?.!]*\s*$/i;
 
-export const emailOn = () => !!(process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN);
+export const brevoOn = () => !!process.env.BREVO_API_KEY;
+export const gmailOn = () => !!(process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN);
+export const emailOn = () => brevoOn() || gmailOn();
+
+const SENDER_EMAIL = () => process.env.SENDER_EMAIL || 'michaelolaoluwagab@gmail.com';
+const SENDER_NAME = () => process.env.SENDER_NAME || 'Olaoluwa Michael';
 
 /**
- * Obtain a fresh Google OAuth2 access token using the refresh token
+ * Send an individual email directly via Brevo Transactional Email API (v3)
  */
-async function getAccessToken() {
-  const clientId = process.env.GMAIL_CLIENT_ID;
-  const clientSecret = process.env.GMAIL_CLIENT_SECRET;
-  const refreshToken = process.env.GMAIL_REFRESH_TOKEN;
-
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error('Gmail API credentials missing in environment.');
+export async function sendBrevoEmail({ to, subject, text, html }) {
+  if (!process.env.BREVO_API_KEY) {
+    throw new Error('BREVO_API_KEY is not configured in Vercel.');
   }
 
+  const payload = {
+    sender: { name: SENDER_NAME(), email: SENDER_EMAIL() },
+    to: [{ email: to }],
+    subject: subject || 'Message from Olaoluwa Michael',
+    textContent: text,
+    htmlContent: html || `<p style="font-family:sans-serif;font-size:16px;line-height:1.6;color:#222;">${text.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')}</p><p>With love,<br><strong>Olaoluwa Michael</strong></p>`
+  };
+
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': process.env.BREVO_API_KEY,
+      'content-type': 'application/json',
+      accept: 'application/json'
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20000)
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Brevo send error: ${data.message || res.status}`);
+  }
+  return { ok: true, messageId: data.messageId, provider: 'brevo' };
+}
+
+/**
+ * Gmail OAuth2 Access Token Refresh
+ */
+async function getGmailAccessToken() {
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
+      client_id: process.env.GMAIL_CLIENT_ID,
+      client_secret: process.env.GMAIL_CLIENT_SECRET,
+      refresh_token: process.env.GMAIL_REFRESH_TOKEN,
       grant_type: 'refresh_token'
     })
   });
-
   const data = await res.json();
-  if (!res.ok || !data.access_token) {
-    throw new Error(`Failed to refresh Gmail token: ${data.error_description || data.error || res.status}`);
-  }
+  if (!res.ok || !data.access_token) throw new Error('Gmail token refresh failed.');
   return data.access_token;
 }
 
 /**
- * Search the user's Gmail inbox for messages matching query (sender name, email, or keywords)
+ * Send via Gmail API
  */
-export async function searchEmails(query, max = 5) {
-  const token = await getAccessToken();
-  const q = encodeURIComponent(`to:me ${query}`);
-  const listRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=${max}`, {
-    headers: { authorization: `Bearer ${token}` }
-  });
-  const listData = await listRes.json();
-  if (!listData.messages || !listData.messages.length) return [];
-
-  const emails = [];
-  for (const item of listData.messages) {
-    const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${item.id}?format=full`, {
-      headers: { authorization: `Bearer ${token}` }
-    });
-    const msg = await msgRes.json();
-    const headers = msg.payload?.headers || [];
-    const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
-
-    // Extract text body
-    let body = '';
-    if (msg.snippet) body = msg.snippet;
-    const parts = msg.payload?.parts || [];
-    for (const part of parts) {
-      if (part.mimeType === 'text/plain' && part.body?.data) {
-        body = Buffer.from(part.body.data, 'base64').toString('utf8');
-        break;
-      }
-    }
-
-    emails.push({
-      id: msg.id,
-      threadId: msg.threadId,
-      from: getHeader('From'),
-      to: getHeader('To'),
-      subject: getHeader('Subject'),
-      date: getHeader('Date'),
-      snippet: msg.snippet,
-      body: body.slice(0, 4000)
-    });
-  }
-  return emails;
-}
-
-/**
- * Construct RFC 2822 email payload and send via Gmail API
- */
-export async function sendEmail({ to, subject, body, inReplyTo, threadId }) {
-  const token = await getAccessToken();
+export async function sendGmailEmail({ to, subject, body, threadId }) {
+  const token = await getGmailAccessToken();
   const utf8Subject = `=?utf-8?B?${Buffer.from(subject).toString('base64')}?=`;
   const messageParts = [
     `To: ${to}`,
     'Content-Type: text/plain; charset=utf-8',
     'MIME-Version: 1.0',
-    `Subject: ${utf8Subject}`
+    `Subject: ${utf8Subject}`,
+    '',
+    body
   ];
-
-  if (inReplyTo) {
-    messageParts.push(`In-Reply-To: ${inReplyTo}`);
-    messageParts.push(`References: ${inReplyTo}`);
-  }
-
-  messageParts.push('', body);
   const rawMessage = Buffer.from(messageParts.join('\r\n'))
     .toString('base64')
     .replace(/\+/g, '-')
@@ -114,42 +91,41 @@ export async function sendEmail({ to, subject, body, inReplyTo, threadId }) {
 
   const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json'
-    },
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify(payload)
   });
-
   const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Gmail send error: ${data.error?.message || res.status}`);
-  }
-  return { ok: true, id: data.id, threadId: data.threadId };
+  if (!res.ok) throw new Error(data.error?.message || 'Gmail send failed');
+  return { ok: true, id: data.id, provider: 'gmail' };
 }
 
 /**
- * Generate prompt instructions for Gemini to draft a reply in Michael's voice
+ * Unified dispatch: uses Brevo by default, or Gmail if configured
  */
-export function draftReplyPrompt(targetEmail, instructions) {
-  return `You are drafting an email reply for Olaoluwa Michael ("Michael"), a Nigerian Christian author, creator and developer.
-Write the reply AS Michael in his authentic, warm, polite, and direct communication style.
+export async function sendDirectEmail({ to, subject, body, threadId }) {
+  if (brevoOn()) {
+    return sendBrevoEmail({ to, subject, text: body });
+  }
+  if (gmailOn()) {
+    return sendGmailEmail({ to, subject, body, threadId });
+  }
+  throw new Error('Neither BREVO_API_KEY nor Gmail API is configured.');
+}
 
-Original Email Received:
-- From: ${targetEmail.from}
-- Subject: ${targetEmail.subject}
-- Date: ${targetEmail.date}
-- Content:
-"""
-${targetEmail.body || targetEmail.snippet}
-"""
+/**
+ * Prompt instruction to draft a single direct email
+ */
+export function draftDirectEmailPrompt(to, topic) {
+  return `You are drafting a personal email from Olaoluwa Michael ("Michael"), a Nigerian Christian author, creator and developer.
+Write the email AS Michael to ${to}.
+Topic/Instructions from Michael:
+"""${topic || 'Friendly check-in / greeting'}"""
 
-Instructions from Michael on what to say:
-"""${instructions}"""
+Style guidelines:
+- Warm, polite, concise, professional yet personal.
+- Clean paragraphs, no fluff, no corporate buzzwords.
+- Sign off warmly as "With love,\nOlaoluwa Michael" or "Best regards,\nOlaoluwa Michael".
 
-Output JSON only in this exact format:
-{
-  "subject": "Re: ${targetEmail.subject.replace(/^Re:\s*/i, '')}",
-  "body": "The complete draft of the email reply text without placeholder brackets"
-}`;
+Return ONLY JSON:
+{"subject": "Clear, relevant subject line", "body": "Full body of the email without placeholder brackets"}`;
 }

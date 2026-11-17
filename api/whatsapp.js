@@ -1462,8 +1462,8 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       if (EM.YES_RE.test(userText)) {
         const p = state.emailPending; state.emailPending = null;
         try {
-          await EM.sendEmail({ to: p.to, subject: p.subject, body: p.body, threadId: p.threadId });
-          return finish(`✅ *Email sent!*\nTo: ${p.to}\nSubject: ${p.subject}`, userText, 'Email sent.');
+          const res = await EM.sendDirectEmail({ to: p.to, subject: p.subject, body: p.body, threadId: p.threadId });
+          return finish(`✅ *Email sent successfully via ${res.provider === 'brevo' ? 'Brevo' : 'Gmail'}!*\n\n*To:* ${p.to}\n*Subject:* ${p.subject}`, userText, 'Email sent.');
         } catch (err) {
           log('Email send failed', err.message);
           return finish(`⚠️ Failed to send email: ${err.message}`, null, null);
@@ -1514,24 +1514,22 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
       }
     }
 
-    // --- TRIGGER EMAIL REPLY ---
+    // --- TRIGGER DIRECT EMAIL (BREVO / GMAIL) ---
     const emMatch = userText.match(EM.EMAIL_RE);
     if (emMatch) {
-      if (!isOwner) return finish('Only Michael can manage emails here.', null, null);
-      if (!EM.emailOn()) return finish('📧 Gmail API is not configured yet. Add GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REFRESH_TOKEN in Vercel.', null, null);
-      const query = emMatch[1].trim();
+      if (!isOwner) return finish('Only Michael can send emails here.', null, null);
+      if (!EM.emailOn()) return finish('📧 Email sending is not configured yet (BREVO_API_KEY missing).', null, null);
+      const recipient = emMatch[1].trim();
+      const topic = emMatch[2].trim();
       try {
-        const found = await EM.searchEmails(query, 3);
-        if (!found.length) return finish(`🔍 No recent emails found matching "${query}".`, null, null);
-        const target = found[0];
-        const draftRes = await askGemini([], kb.facts, [{ text: EM.draftReplyPrompt(target, query) }], started, { cool: state.cool, track: state, json: true });
+        const draftRes = await askGemini([], kb.facts, [{ text: EM.draftDirectEmailPrompt(recipient, topic) }], started, { cool: state.cool, track: state, json: true });
         state.cool = Object.fromEntries(Object.entries(draftRes.cool || {}).filter(([, v]) => v > Date.now()));
-        let parsed = { subject: `Re: ${target.subject}`, body: 'Thanks for reaching out.' };
+        let parsed = { subject: 'Message from Olaoluwa Michael', body: topic || 'Hello, reaching out to connect.' };
         try { parsed = JSON.parse(draftRes.text); } catch {}
-        state.emailPending = { to: target.from, subject: parsed.subject, body: parsed.body, threadId: target.threadId, at: Date.now() };
-        return finish(`📧 *Draft reply for ${target.from}*\n*Subject:* ${parsed.subject}\n─────────────────────\n${parsed.body}\n─────────────────────\n\nReply *yes* to send, or tell me what to change.`, userText, 'Drafted email');
+        state.emailPending = { to: recipient, subject: parsed.subject, body: parsed.body, at: Date.now() };
+        return finish(`📧 *Draft email for ${recipient}*\n*Subject:* ${parsed.subject}\n─────────────────────\n${parsed.body}\n─────────────────────\n\nReply *yes* to send via Brevo, or tell me what to change.`, userText, 'Drafted email');
       } catch (err) {
-        log('Email search/draft error', err.message);
+        log('Email draft error', err.message);
         return finish(`⚠️ ${err.message}`, null, null);
       }
     }
