@@ -40,6 +40,8 @@ import * as BR from './_brain.js';                // v8: routing, his-world retr
 import { zipFiles } from './_sites.js';
 import * as NL from './_newsletter.js';
 import * as VS from './_verse.js';
+import * as EM from './_email.js';
+import * as EP from './_episode.js';
 
 export const config = { maxDuration: 60 };
 
@@ -130,6 +132,7 @@ export async function loadState(num, ctx = liveCtx()) {
   return { history: s.history || [], memory: s.memory || [], seen: s.seen || [], cool: s.cool || {}, migrated: !!s.migrated, pending: s.pending || null, lastIn: s.lastIn || 0, lastRead: s.lastRead || null, img: s.img || null, lastImage: s.lastImage || null,
     usage: s.usage || null, jobsUntil: s.jobsUntil || 0, sc: s.sc || [], lastQA: s.lastQA || null, keeperFor: s.keeperFor || null, schedNext: s.schedNext ?? null,
     lastMedia: s.lastMedia || null, sowLast: s.sowLast || [], nlPending: s.nlPending || null,
+    emailPending: s.emailPending || null, episodePending: s.episodePending || null,
     brain: s.brain || null, lastBrain: s.lastBrain || null, remPending: s.remPending || null, remPendingReasked: s.remPendingReasked || false, lastPolish: s.lastPolish || null };   // v8: per-key strong/lite counts for routing + last retrieval
 }
 export async function saveState(num, s, ctx = liveCtx()) {
@@ -1452,6 +1455,99 @@ export async function processMessage(msg, contactName, ctx = liveCtx()) {
     if (rd && !(state.pending && !rd.url)) return readFlow(rd, userText);
     const sq = V.detectSearch(userText) || BR.detectFresh(userText);   // v8: more "fresh info" questions go to the live web
     if (sq) { const done = await searchFlow(sq, userText); if (done) return done; }
+
+    // --- EMAIL PENDING FLOW ---
+    if (state.emailPending) {
+      if (EM.YES_RE.test(userText)) {
+        const p = state.emailPending; state.emailPending = null;
+        try {
+          await EM.sendEmail({ to: p.to, subject: p.subject, body: p.body, threadId: p.threadId });
+          return finish(`✅ *Email sent!*\nTo: ${p.to}\nSubject: ${p.subject}`, userText, 'Email sent.');
+        } catch (err) {
+          log('Email send failed', err.message);
+          return finish(`⚠️ Failed to send email: ${err.message}`, null, null);
+        }
+      }
+      if (EM.CANCEL_RE.test(userText)) {
+        state.emailPending = null;
+        return finish('🗑️ Email draft dropped. Nothing was sent.', userText, 'Draft cancelled.');
+      }
+      const ed = await askGemini(state.history, kb.facts, [{
+        text: `Current email draft to ${state.emailPending.to}:\nSubject: ${state.emailPending.subject}\n\n${state.emailPending.body}\n\nMichael's feedback: "${userText}"\nRewrite the email body incorporating this feedback. Output ONLY the new body.`
+      }], started, { cool: state.cool, track: state });
+      state.cool = Object.fromEntries(Object.entries(ed.cool || {}).filter(([, v]) => v > Date.now()));
+      if (ed.ok) {
+        state.emailPending.body = ed.text.trim();
+        return finish(`✏️ *Updated email draft:*\n\n*To:* ${state.emailPending.to}\n*Subject:* ${state.emailPending.subject}\n─────────────────────\n${state.emailPending.body}\n─────────────────────\n\nReply *yes* to send, or tell me what to change.`, userText, 'Updated email draft');
+      }
+    }
+
+    // --- EPISODE PENDING FLOW ---
+    if (state.episodePending) {
+      const p = state.episodePending;
+      if (/^\s*(?:yes|save|looks good|done|confirm|approve)\s*[?.!]*\s*$/i.test(userText)) {
+        state.episodePending = null;
+        if (kb) { kb.activeDoc = p.docId; kb.currentEpisode = (kb.currentEpisode || 1) + 1; await saveKB(from, kb, ctx); }
+        return finish(`✅ *Episode saved!*\n${p.title || 'Episode'} is locked in and ready.\n\nSend *next episode* anytime to write the next part!`, userText, 'Episode approved.');
+      }
+      if (/^\s*(?:cancel|drop|stop|nevermind|no)\s*[?.!]*\s*$/i.test(userText)) {
+        state.episodePending = null;
+        return finish('🗑️ Episode draft dropped.', userText, 'Episode dropped.');
+      }
+      const rev = await askGemini(state.history, kb.facts, [{
+        text: `Current Episode Draft:\n"""\n${p.text}\n"""\n\nMichael's feedback:\n"""\n${userText}\n"""\n\nRewrite the episode incorporating all of Michael's feedback while maintaining his authentic storytelling voice. Return ONLY the rewritten episode.`
+      }], started, { cool: state.cool, track: state });
+      state.cool = Object.fromEntries(Object.entries(rev.cool || {}).filter(([, v]) => v > Date.now()));
+      if (rev.ok) {
+        p.text = rev.text.trim();
+        return finish(`✏️ *Updated Episode:*\n\n${p.text}\n\n─────────────────────\nReply *yes* to save, or tell me what else to change.`, userText, 'Updated episode');
+      }
+    }
+
+    // --- TRIGGER EMAIL REPLY ---
+    const emMatch = userText.match(EM.EMAIL_RE);
+    if (emMatch) {
+      if (!isOwner) return finish('Only Michael can manage emails here.', null, null);
+      if (!EM.emailOn()) return finish('📧 Gmail API is not configured yet. Add GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, and GMAIL_REFRESH_TOKEN in Vercel.', null, null);
+      const query = emMatch[1].trim();
+      try {
+        const found = await EM.searchEmails(query, 3);
+        if (!found.length) return finish(`🔍 No recent emails found matching "${query}".`, null, null);
+        const target = found[0];
+        const draftRes = await askGemini([], kb.facts, [{ text: EM.draftReplyPrompt(target, query) }], started, { cool: state.cool, track: state, json: true });
+        state.cool = Object.fromEntries(Object.entries(draftRes.cool || {}).filter(([, v]) => v > Date.now()));
+        let parsed = { subject: `Re: ${target.subject}`, body: 'Thanks for reaching out.' };
+        try { parsed = JSON.parse(draftRes.text); } catch {}
+        state.emailPending = { to: target.from, subject: parsed.subject, body: parsed.body, threadId: target.threadId, at: Date.now() };
+        return finish(`📧 *Draft reply for ${target.from}*\n*Subject:* ${parsed.subject}\n─────────────────────\n${parsed.body}\n─────────────────────\n\nReply *yes* to send, or tell me what to change.`, userText, 'Drafted email');
+      } catch (err) {
+        log('Email search/draft error', err.message);
+        return finish(`⚠️ ${err.message}`, null, null);
+      }
+    }
+
+    // --- TRIGGER EPISODE FROM GOOGLE DOC ---
+    const epMatch = userText.match(EP.EPISODE_RE);
+    if (epMatch) {
+      if (!isOwner) return finish('Only Michael can create story episodes here.', null, null);
+      const query = epMatch[1].trim();
+      let docId = EP.extractDocId(query) || (kb && kb.activeDoc);
+      if (!docId) return finish('📄 Paste your Google Doc link with the command, e.g.:\n_make episode from https://docs.google.com/document/d/..._\n(Make sure sharing is set to *"Anyone with the link can view"*).', null, null);
+      try {
+        const docData = await EP.fetchDocText(docId);
+        const epNum = (kb?.currentEpisode || 1);
+        const epRes = await askGemini(state.history, kb.facts, [{ text: EP.episodePrompt(docData.text, query.replace(EP.DOC_LINK_RE, '').trim(), epNum) }], started, { cool: state.cool, track: state });
+        state.cool = Object.fromEntries(Object.entries(epRes.cool || {}).filter(([, v]) => v > Date.now()));
+        if (!epRes.ok) return finish('⚠️ I had trouble generating the episode just now. Try again in a minute.', null, null);
+        const episodeText = epRes.text.trim();
+        const titleMatch = episodeText.match(/🎬\s*\*?([^\n*]+)\*?/);
+        const title = titleMatch ? titleMatch[1] : `Episode ${epNum}`;
+        state.episodePending = { docId, title, text: episodeText, at: Date.now() };
+        return finish(`📖 *Draft Episode from Google Doc:*\n\n${episodeText}\n\n─────────────────────\nReply *yes* to approve, or tell me what you want changed.`, userText, 'Drafted episode');
+      } catch (err) {
+        return finish(`⚠️ ${err.message}`, null, null);
+      }
+    }
     if (state.pending) {
       if (YES_RE.test(userText)) return publishFlow(userText);
       if (CANCEL_RE.test(userText)) { state.pending = null; return finish('🗑️ Draft dropped. Nothing was posted.', userText, 'Draft dropped.'); }
